@@ -1,0 +1,138 @@
+name: YouTube Downloader (No Cookies Required)
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube Video URL'
+        required: true
+        type: string
+      download_type:
+        description: 'Download type'
+        required: true
+        default: 'video'
+        type: choice
+        options:
+          - video
+          - audio
+      video_quality:
+        description: 'Video quality'
+        required: false
+        default: '720p'
+        type: choice
+        options:
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+      audio_format:
+        description: 'Audio format'
+        required: false
+        default: 'mp3'
+        type: choice
+        options:
+          - mp3
+          - m4a
+
+jobs:
+  download-without-cookies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python & Node.js
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          
+          # Install Node.js (required for YouTube JS runtime)
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          
+          echo "✅ Dependencies installed"
+          echo "Node version: $(node --version)"
+      
+      - name: Download video (mobile client emulation - no cookies needed)
+        env:
+          VIDEO_URL: ${{ github.event.inputs.youtube_url }}
+          DOWNLOAD_TYPE: ${{ github.event.inputs.download_type }}
+          VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+          AUDIO_FORMAT: ${{ github.event.inputs.audio_format }}
+        run: |
+          # Map quality to yt-dlp format
+          case "$VIDEO_QUALITY" in
+            "1080p") FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]" ;;
+            "720p")  FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]" ;;
+            "480p")  FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]" ;;
+            "360p")  FORMAT="bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]" ;;
+            *)       FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best" ;;
+          esac
+          
+          # Use Android client to avoid bot detection (no cookies needed!)
+          EXTRACTOR_ARGS="youtube:player_client=android,android_embedded"
+          
+          if [ "$DOWNLOAD_TYPE" = "audio" ]; then
+            echo "🎵 Downloading audio as $AUDIO_FORMAT..."
+            yt-dlp \
+              --extractor-args "$EXTRACTOR_ARGS" \
+              --js-runtime node \
+              --extract-audio \
+              --audio-format "$AUDIO_FORMAT" \
+              --audio-quality 0 \
+              --add-metadata \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
+              "$VIDEO_URL"
+          else
+            echo "🎥 Downloading video at $VIDEO_QUALITY..."
+            yt-dlp \
+              --extractor-args "$EXTRACTOR_ARGS" \
+              --js-runtime node \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
+              "$VIDEO_URL"
+          fi
+      
+      - name: List downloaded files
+        run: |
+          echo "📁 Downloaded files:"
+          ls -lh *.mp4 *.mp3 *.m4a 2>/dev/null || echo "⚠️ No files downloaded"
+      
+      - name: Commit and push
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add *.mp4 *.mp3 *.m4a 2>/dev/null || true
+          
+          if git diff --staged --quiet; then
+            echo "ℹ️ No new files to commit"
+          else
+            git commit -m "Download from ${{ github.event.inputs.youtube_url }} [$(date +'%Y-%m-%d')]"
+            git push
+            echo "✅ Files pushed to repository"
+          fi
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "## YouTube Download Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ github.event.inputs.youtube_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** Completed" >> $GITHUB_STEP_SUMMARY
+          echo "**Method:** Android client emulation (no cookies)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh *.mp4 *.mp3 *.m4a 2>/dev/null | awk '{print $9 " (" $5 ")"}' >> $GITHUB_STEP_SUMMARY || echo "None" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
