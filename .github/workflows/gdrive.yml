@@ -1,0 +1,337 @@
+name: Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Google Drive File ID'
+        required: true
+        type: string
+        default: '1UGiDKbKViudLxZpMvP-0fK7bamW38-kL'
+      output_filename:
+        description: 'Output filename (default: CHOICE.zip)'
+        required: false
+        type: string
+        default: 'CHOICE.zip'
+      force_redownload:
+        description: 'Force re-download even if parts exist'
+        required: false
+        type: boolean
+        default: false
+      target_directory:
+        description: 'Target directory for parts (default: downloaded_files)'
+        required: false
+        type: string
+        default: 'downloaded_files'
+
+jobs:
+  download-split-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install gdown
+      run: pip install gdown
+    
+    - name: Create target directory
+      run: |
+        mkdir -p "${{ github.event.inputs.target_directory }}"
+        echo "Target directory: ${{ github.event.inputs.target_directory }}"
+    
+    - name: Download and split file (if needed)
+      run: |
+        TARGET_DIR="${{ github.event.inputs.target_directory }}"
+        OUTPUT_FILE="${{ github.event.inputs.output_filename }}"
+        PART_PREFIX="${TARGET_DIR}/${OUTPUT_FILE}.part_"
+        
+        # Check if all parts already exist
+        PART_COUNT=$(ls -1 ${PART_PREFIX}* 2>/dev/null | wc -l)
+        
+        if [ "${{ github.event.inputs.force_redownload }}" = "false" ] && [ ${PART_COUNT} -gt 0 ]; then
+          echo "Found ${PART_COUNT} existing parts in ${TARGET_DIR}. Skipping download."
+          echo "SKIP_DOWNLOAD=true" >> $GITHUB_ENV
+          exit 0
+        fi
+        
+        # Clean old parts if force re-download
+        if [ "${{ github.event.inputs.force_redownload }}" = "true" ]; then
+          echo "Force re-download enabled. Removing existing parts..."
+          rm -f ${PART_PREFIX}* 2>/dev/null
+          rm -f ${TARGET_DIR}/original.checksum 2>/dev/null
+        fi
+        
+        # Download the file
+        echo "Downloading file from Google Drive..."
+        gdown "https://drive.google.com/uc?id=${{ github.event.inputs.file_id }}" \
+              -O "${TARGET_DIR}/${{ github.event.inputs.output_filename }}"
+        
+        # Check if download succeeded
+        if [ ! -f "${TARGET_DIR}/${{ github.event.inputs.output_filename }}" ]; then
+          echo "Download failed!"
+          exit 1
+        fi
+        
+        # Display file size
+        FILE_SIZE=$(stat -c%s "${TARGET_DIR}/${{ github.event.inputs.output_filename }}")
+        SIZE_GB=$((FILE_SIZE / 1073741824))
+        echo "Downloaded file size: ${SIZE_GB} GB"
+        
+        # Split into 95MB chunks
+        echo "Splitting file into 95MB chunks..."
+        split -b 95M "${TARGET_DIR}/${{ github.event.inputs.output_filename }}" "${PART_PREFIX}"
+        
+        # Create checksums
+        md5sum "${TARGET_DIR}/${{ github.event.inputs.output_filename }}" > ${TARGET_DIR}/original.checksum
+        
+        # Remove original file
+        rm "${TARGET_DIR}/${{ github.event.inputs.output_filename }}"
+        
+        # Count new parts
+        NEW_PART_COUNT=$(ls -1 ${PART_PREFIX}* 2>/dev/null | wc -l)
+        echo "Created ${NEW_PART_COUNT} new parts in ${TARGET_DIR}/"
+        echo "SKIP_DOWNLOAD=false" >> $GITHUB_ENV
+      
+    - name: Configure Git
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git config http.postBuffer 524288000
+    
+    - name: Create reassembly script in directory
+      run: |
+        TARGET_DIR="${{ github.event.inputs.target_directory }}"
+        OUTPUT_FILE="${{ github.event.inputs.output_filename }}"
+        
+        # Create reassembly script inside the target directory
+        cat > ${TARGET_DIR}/reassemble.sh << 'EOF'
+        #!/bin/bash
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        cd "$SCRIPT_DIR"
+        
+        echo "Reassembling file from parts..."
+        
+        # Find all part files
+        PART_FILES=$(ls -1 ${OUTPUT_FILE}.part_* 2>/dev/null | sort)
+        
+        if [ -z "$PART_FILES" ]; then
+          echo "No part files found"
+          exit 1
+        fi
+        
+        # Count parts
+        PART_COUNT=$(echo "$PART_FILES" | wc -l)
+        echo "Found ${PART_COUNT} part files"
+        
+        # Reassemble
+        cat ${OUTPUT_FILE}.part_* > ${OUTPUT_FILE}
+        
+        # Verify checksum
+        if [ -f original.checksum ]; then
+          if md5sum -c original.checksum 2>/dev/null; then
+            echo "Checksum verified - File reassembled successfully!"
+            ls -lh ${OUTPUT_FILE}
+          else
+            echo "Checksum verification failed!"
+            exit 1
+          fi
+        else
+          echo "No checksum file found for verification"
+          ls -lh ${OUTPUT_FILE}
+        fi
+        EOF
+        
+        # Replace placeholder in script
+        sed -i "s/\${OUTPUT_FILE}/${{ github.event.inputs.output_filename }}/g" ${TARGET_DIR}/reassemble.sh
+        chmod +x ${TARGET_DIR}/reassemble.sh
+        
+        # Create a root-level reassemble script that calls the directory one
+        cat > reassemble.sh << EOF
+        #!/bin/bash
+        cd "${{ github.event.inputs.target_directory }}"
+        ./reassemble.sh
+        EOF
+        chmod +x reassemble.sh
+        
+        # Add scripts to git
+        git add ${TARGET_DIR}/reassemble.sh reassemble.sh
+        git commit -m "Add reassembly scripts for ${{ github.event.inputs.output_filename }}" || echo "No changes to commit"
+        git push origin HEAD:${GITHUB_REF#refs/heads/} || echo "Push failed"
+    
+    - name: Push parts one by one to directory
+      run: |
+        TARGET_DIR="${{ github.event.inputs.target_directory }}"
+        PART_PREFIX="${TARGET_DIR}/${{ github.event.inputs.output_filename }}.part_"
+        
+        # Get list of part files
+        PART_FILES=$(ls -1 ${PART_PREFIX}* 2>/dev/null | sort) || true
+        
+        if [ -z "$PART_FILES" ]; then
+          echo "No part files found to push in ${TARGET_DIR}/"
+          exit 0
+        fi
+        
+        TOTAL_PARTS=$(echo "$PART_FILES" | wc -l)
+        CURRENT=0
+        SUCCESS=0
+        SKIPPED=0
+        
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📦 Pushing ${TOTAL_PARTS} parts from ${TARGET_DIR}/"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Create an array of part files
+        PARTS_ARRAY=($PART_FILES)
+        
+        for PART_FILE in "${PARTS_ARRAY[@]}"; do
+          CURRENT=$((CURRENT + 1))
+          REL_PATH="${PART_FILE}"
+          
+          # Check if file is already in repository
+          if git ls-files --error-unmatch "$REL_PATH" >/dev/null 2>&1; then
+            echo "[${CURRENT}/${TOTAL_PARTS}] ⏭️  Skipping ${REL_PATH} (already in repo)"
+            SKIPPED=$((SKIPPED + 1))
+            continue
+          fi
+          
+          # Add this specific part
+          echo "[${CURRENT}/${TOTAL_PARTS}] 📤 Adding ${REL_PATH}..."
+          git add "$REL_PATH"
+          
+          # Commit this part
+          git commit -m "Add part ${CURRENT}/${TOTAL_PARTS}: ${REL_PATH}"
+          
+          # Push this single commit
+          echo "[${CURRENT}/${TOTAL_PARTS}] 🚀 Pushing ${REL_PATH}..."
+          if git push origin HEAD:${GITHUB_REF#refs/heads/}; then
+            echo "[${CURRENT}/${TOTAL_PARTS}] ✅ Successfully pushed ${REL_PATH}"
+            SUCCESS=$((SUCCESS + 1))
+          else
+            echo "[${CURRENT}/${TOTAL_PARTS}] ❌ Failed to push ${REL_PATH}"
+            exit 1
+          fi
+          
+          # Small delay to avoid rate limiting
+          sleep 2
+        done
+        
+        # Push checksum file if it exists
+        CHECKSUM_FILE="${TARGET_DIR}/original.checksum"
+        if [ -f "${CHECKSUM_FILE}" ] && ! git ls-files --error-unmatch "${CHECKSUM_FILE}" >/dev/null 2>&1; then
+          echo "📤 Adding checksum file..."
+          git add "${CHECKSUM_FILE}"
+          git commit -m "Add checksum for verification in ${TARGET_DIR}/"
+          git push origin HEAD:${GITHUB_REF#refs/heads/}
+        fi
+        
+        # Push directory README if it doesn't exist
+        README_FILE="${TARGET_DIR}/README.md"
+        if [ ! -f "${README_FILE}" ]; then
+          echo "# Downloaded Files Directory" > "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "This directory contains split parts of files downloaded from Google Drive." >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "## Files in this directory" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "- **${{ github.event.inputs.output_filename }}.part_*** - Split file parts (95MB each)" >> "${README_FILE}"
+          echo "- **original.checksum** - MD5 checksum for verification" >> "${README_FILE}"
+          echo "- **reassemble.sh** - Script to reassemble the original file" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "## How to reassemble" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "Run the reassembly script from the root directory:" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo '```bash' >> "${README_FILE}"
+          echo "./reassemble.sh" >> "${README_FILE}"
+          echo '```' >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "Or from this directory:" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo '```bash' >> "${README_FILE}"
+          echo "cd ${{ github.event.inputs.target_directory }}" >> "${README_FILE}"
+          echo "./reassemble.sh" >> "${README_FILE}"
+          echo '```' >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "## File Information" >> "${README_FILE}"
+          echo "" >> "${README_FILE}"
+          echo "- **Original filename:** ${{ github.event.inputs.output_filename }}" >> "${README_FILE}"
+          echo "- **Google Drive ID:** ${{ github.event.inputs.file_id }}" >> "${README_FILE}"
+          echo "- **Part size:** 95MB" >> "${README_FILE}"
+          echo "- **Total parts:** ${TOTAL_PARTS}" >> "${README_FILE}"
+          
+          git add "${README_FILE}"
+          git commit -m "Add README for ${TARGET_DIR}/ directory" || echo "No changes"
+          git push origin HEAD:${GITHUB_REF#refs/heads/} || echo "Push failed"
+        fi
+        
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✅ PUSH COMPLETE"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📊 Statistics:"
+        echo "   Directory: ${TARGET_DIR}/"
+        echo "   Total parts: ${TOTAL_PARTS}"
+        echo "   Successfully pushed: ${SUCCESS}"
+        echo "   Skipped (already exist): ${SKIPPED}"
+        echo ""
+        echo "💡 To reassemble the file, run: ./reassemble.sh"
+    
+    - name: Create summary
+      run: |
+        TARGET_DIR="${{ github.event.inputs.target_directory }}"
+        PART_COUNT=$(ls -1 ${TARGET_DIR}/${{ github.event.inputs.output_filename }}.part_* 2>/dev/null | wc -l)
+        
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        # 📦 Download Complete
+        
+        **File:** \`${{ github.event.inputs.output_filename }}\`
+        **Google Drive ID:** \`${{ github.event.inputs.file_id }}\`
+        **Target Directory:** \`${TARGET_DIR}/\`
+        
+        ## Parts Status
+        - **Total parts:** ${PART_COUNT}
+        - **Part size:** 95MB each
+        - **Location:** \`${TARGET_DIR}/\` directory
+        - **Status:** Pushed to repository
+        
+        ## How to Reassemble
+        \`\`\`bash
+        ./reassemble.sh
+        \`\`\`
+        
+        Or manually:
+        \`\`\`bash
+        cd ${TARGET_DIR}
+        cat ${{ github.event.inputs.output_filename }}.part_* > ${{ github.event.inputs.output_filename }}
+        md5sum -c original.checksum
+        \`\`\`
+        
+        ## Manual Download
+        To download all parts:
+        \`\`\`bash
+        git clone ${{ github.server_url }}/${{ github.repository }}
+        cd ${{ github.repository }}
+        ./reassemble.sh
+        \`\`\`
+        
+        ## Directory Structure
+        \`\`\`
+        ${{ github.repository }}/
+        ├── reassemble.sh (root-level convenience script)
+        └── ${TARGET_DIR}/
+            ├── ${{ github.event.inputs.output_filename }}.part_*
+            ├── original.checksum
+            ├── reassemble.sh
+            └── README.md
+        \`\`\`
+        EOF
