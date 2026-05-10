@@ -1,0 +1,337 @@
+name: Download Paper by DOI (Enhanced)
+
+on:
+  workflow_dispatch:
+    inputs:
+      doi:
+        description: 'DOI of the paper (e.g., 10.1145/3763319)'
+        required: true
+        type: string
+      method:
+        description: 'Download method'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - scihub
+          - direct
+          - crossref
+      output_folder:
+        description: 'Output folder'
+        required: false
+        default: 'papers'
+
+jobs:
+  download-paper:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests beautifulsoup4 habanero tqdm selenium webdriver-manager cryptography pyOpenSSL urllib3
+    
+    - name: Create advanced downloader
+      run: |
+        cat > advanced_downloader.py << 'EOF'
+        import os
+        import re
+        import time
+        import requests
+        import hashlib
+        from pathlib import Path
+        from urllib.parse import urlparse
+        from habanero import cn
+        from bs4 import BeautifulSoup
+        import ssl
+        import urllib3
+        
+        # Disable SSL warnings for some mirrors
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        class PaperDownloader:
+            def __init__(self, doi, output_folder='papers'):
+                self.doi = doi
+                self.output_folder = Path(output_folder)
+                self.output_folder.mkdir(parents=True, exist_ok=True)
+                self.session = requests.Session()
+                self.session.headers.update({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                })
+            
+            def get_metadata(self):
+                """Get paper metadata from multiple sources"""
+                try:
+                    # Try Crossref first
+                    work = cn.content_works(ids=self.doi)
+                    title = work['message']['title'][0]
+                    # Clean filename
+                    title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                    title = title[:100]  # Limit length
+                    print(f"Paper title: {title}")
+                    return title
+                except Exception as e:
+                    print(f"Crossref error: {e}")
+                    # Fallback to DOI-based filename
+                    return self.doi.replace('/', '_').replace('.', '_')
+            
+            def method_scihub_direct(self):
+                """Try direct Sci-Hub PDF download with multiple mirror patterns"""
+                mirrors = [
+                    ('https://sci-hub.se', False),
+                    ('https://sci-hub.st', False),
+                    ('https://sci-hub.ru', False),
+                    ('https://sci-hub.do', True),  # SSL verify off
+                    ('https://sci-hub.is', False),
+                    ('https://sci-hub.wf', False),
+                    ('https://sci-hub.ee', False),
+                    ('https://sci-hub.tw', False),
+                ]
+                
+                for mirror, verify_ssl in mirrors:
+                    try:
+                        print(f"Trying mirror: {mirror}")
+                        url = f"{mirror}/{self.doi}"
+                        
+                        # Use different timeouts and settings
+                        response = self.session.get(url, verify=verify_ssl, timeout=30)
+                        
+                        if response.status_code != 200:
+                            continue
+                        
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # Multiple PDF extraction patterns
+                        pdf_patterns = [
+                            lambda x: x.find('button', {'onclick': re.compile(r"location\.href='([^']+\.pdf)'")}),
+                            lambda x: x.find('iframe', src=re.compile(r'\.pdf')),
+                            lambda x: x.find('embed', src=re.compile(r'\.pdf')),
+                            lambda x: x.find('a', href=re.compile(r'\.pdf')),
+                        ]
+                        
+                        pdf_url = None
+                        
+                        # Check for embedded PDF iframe
+                        iframes = soup.find_all('iframe')
+                        for iframe in iframes:
+                            src = iframe.get('src', '')
+                            if '.pdf' in src or '/pdf/' in src:
+                                pdf_url = src
+                                break
+                        
+                        # Check for direct links
+                        if not pdf_url:
+                            links = soup.find_all('a', href=True)
+                            for link in links:
+                                href = link['href']
+                                if '.pdf' in href and not href.startswith('#'):
+                                    pdf_url = href
+                                    break
+                        
+                        if pdf_url:
+                            if pdf_url.startswith('//'):
+                                pdf_url = 'https:' + pdf_url
+                            elif pdf_url.startswith('/'):
+                                parsed = urlparse(mirror)
+                                pdf_url = f"{mirror}{pdf_url}"
+                            
+                            print(f"Found PDF: {pdf_url}")
+                            return self.download_pdf(pdf_url)
+                    
+                    except Exception as e:
+                        print(f"Mirror {mirror} error: {str(e)[:100]}")
+                        continue
+                
+                return None
+            
+            def method_google_scholar(self):
+                """Try Google Scholar as fallback"""
+                try:
+                    search_url = f"https://scholar.google.com/scholar?q={self.doi}"
+                    response = self.session.get(search_url, timeout=30)
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Look for PDF links
+                    pdf_links = soup.find_all('a', href=re.compile(r'\.pdf'))
+                    for link in pdf_links:
+                        pdf_url = link.get('href')
+                        if pdf_url:
+                            return self.download_pdf(pdf_url)
+                except Exception as e:
+                    print(f"Google Scholar error: {e}")
+                return None
+            
+            def method_unpaywall(self):
+                """Try Unpaywall API for legal open access version"""
+                try:
+                    api_url = f"https://api.unpaywall.org/v2/{self.doi}?email=test@example.com"
+                    response = requests.get(api_url, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('best_oa_location'):
+                            pdf_url = data['best_oa_location'].get('url_for_pdf')
+                            if pdf_url:
+                                print(f"Found OA PDF: {pdf_url}")
+                                return self.download_pdf(pdf_url)
+                except Exception as e:
+                    print(f"Unpaywall error: {e}")
+                return None
+            
+            def method_core_api(self):
+                """Try CORE API for open access papers"""
+                try:
+                    api_url = f"https://api.core.ac.uk/v3/search/works?q={self.doi}"
+                    # Free API key not required for basic queries
+                    response = requests.get(api_url, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('results') and data['results'][0].get('downloadUrl'):
+                            pdf_url = data['results'][0]['downloadUrl']
+                            return self.download_pdf(pdf_url)
+                except Exception as e:
+                    print(f"CORE API error: {e}")
+                return None
+            
+            def download_pdf(self, pdf_url):
+                """Download PDF with retry logic"""
+                try:
+                    filename = f"{self.get_metadata()}_{self.doi.replace('/', '_')}.pdf"
+                    output_path = self.output_folder / filename
+                    
+                    # Try multiple times with different headers
+                    for attempt in range(3):
+                        try:
+                            response = self.session.get(pdf_url, timeout=60, stream=True)
+                            if response.status_code == 200:
+                                content_length = int(response.headers.get('content-length', 0))
+                                
+                                if content_length > 10000:  # Must be > 10KB
+                                    with open(output_path, 'wb') as f:
+                                        for chunk in response.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                    
+                                    if output_path.exists() and output_path.stat().st_size > 10000:
+                                        print(f"✅ Downloaded: {output_path}")
+                                        return str(output_path)
+                                else:
+                                    print(f"File too small: {content_length} bytes")
+                            else:
+                                print(f"HTTP {response.status_code}")
+                        except Exception as e:
+                            print(f"Attempt {attempt+1} failed: {e}")
+                            time.sleep(2)
+                    
+                    return None
+                except Exception as e:
+                    print(f"Download error: {e}")
+                    return None
+            
+            def download(self):
+                """Try all methods in sequence"""
+                methods = [
+                    ('Unpaywall (Open Access)', self.method_unpaywall),
+                    ('CORE API', self.method_core_api),
+                    ('Sci-Hub Direct', self.method_scihub_direct),
+                    ('Google Scholar', self.method_google_scholar),
+                ]
+                
+                for method_name, method_func in methods:
+                    print(f"\n📚 Trying method: {method_name}")
+                    result = method_func()
+                    if result:
+                        print(f"✅ Success using {method_name}")
+                        return result
+                    time.sleep(1)
+                
+                # Create error report
+                report_path = self.output_folder / f"FAILED_{self.doi.replace('/', '_')}.txt"
+                with open(report_path, 'w') as f:
+                    f.write(f"DOI: {self.doi}\n")
+                    f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("All download methods failed.\n")
+                    f.write("Try manual download from:\n")
+                    f.write(f"- https://sci-hub.se/{self.doi}\n")
+                    f.write(f"- https://www.researchgate.net/search/publication?q={self.doi}\n")
+                
+                raise Exception(f"Failed to download paper via all methods. Report saved to {report_path}")
+        
+        if __name__ == "__main__":
+            doi = os.environ.get('INPUT_DOI')
+            output_folder = os.environ.get('INPUT_OUTPUT_FOLDER', 'papers')
+            
+            if not doi:
+                raise ValueError("DOI is required")
+            
+            downloader = PaperDownloader(doi, output_folder)
+            result = downloader.download()
+            print(f"::set-output name=file_path::{result}")
+        EOF
+    
+    - name: Download paper with enhanced methods
+      id: download
+      run: |
+        python advanced_downloader.py
+      env:
+        INPUT_DOI: ${{ github.event.inputs.doi }}
+        INPUT_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+    
+    - name: Check if download succeeded
+      id: check
+      run: |
+        if ls papers/*.pdf 1> /dev/null 2>&1; then
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "✅ Paper downloaded successfully"
+        else
+          echo "success=false" >> $GITHUB_OUTPUT
+          echo "⚠️ No PDF found - check the error report"
+        fi
+    
+    - name: Commit and push (if successful)
+      if: steps.check.outputs.success == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add papers/
+        git diff --staged --quiet || git commit -m "Add paper: ${{ github.event.inputs.doi }}"
+        git push || echo "Push failed but files are saved"
+    
+    - name: Upload results (always)
+      uses: actions/upload-artifact@v4
+      with:
+        name: paper-results
+        path: papers/
+        retention-days: 30
+    
+    - name: Create issue on failure
+      if: steps.check.outputs.success == 'false'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `Failed to download paper: ${{ github.event.inputs.doi }}`,
+            body: `The automated download failed for DOI: ${{ github.event.inputs.doi }}
+            
+            Possible reasons:
+            - Sci-Hub mirrors are blocked from GitHub Actions IPs
+            - Paper not available in open access
+            - DOI might be incorrect
+            
+            Try manual download from: https://sci-hub.se/${{ github.event.inputs.doi }}
+            
+            Check the workflow artifacts for the error report.`
+          })
