@@ -1,0 +1,753 @@
+name: Video Downloader from API
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Video API URL (returns JSON with status)'
+        required: true
+        default: ''
+        type: string
+      audio_url:
+        description: 'Audio API URL (optional - returns JSON with status)'
+        required: false
+        default: ''
+        type: string
+      max_wait_time:
+        description: 'Maximum wait time in minutes'
+        required: true
+        default: '30'
+        type: number
+      output_folder:
+        description: 'Folder name to store downloaded files'
+        required: false
+        default: 'downloads'
+        type: string
+
+jobs:
+  download-video:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Install ffmpeg and dependencies properly
+      - name: Install ffmpeg and dependencies
+        run: |
+          echo "========================================="
+          echo "INSTALLING FFMPEG AND DEPENDENCIES"
+          echo "========================================="
+          
+          # Update package list
+          sudo apt-get update
+          
+          # Install ffmpeg with all dependencies
+          sudo apt-get install -y ffmpeg
+          
+          # Also install additional codecs and libraries
+          sudo apt-get install -y \
+            libavcodec-extra \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev
+          
+          # Verify installation
+          echo ""
+          echo "✅ FFmpeg version:"
+          ffmpeg -version | head -3
+          echo ""
+          echo "✅ FFprobe version:"
+          ffprobe -version | head -3
+          
+          # Check if libraries are found
+          echo ""
+          echo "Checking ffmpeg libraries:"
+          ldd $(which ffmpeg) | grep "not found" || echo "All libraries found"
+      
+      # Install other required tools
+      - name: Install other tools
+        run: |
+          echo "Installing curl, jq, and bc..."
+          sudo apt-get install -y curl jq bc
+          
+          echo ""
+          echo "✅ Tools verified:"
+          echo "curl: $(curl --version | head -1)"
+          echo "jq: $(jq --version)"
+          echo "bc: $(bc --version 2>/dev/null | head -1 || echo 'installed')"
+      
+      # Poll both APIs simultaneously and track progress
+      - name: Poll APIs for completion (Video + Audio)
+        id: poll_apis
+        run: |
+          echo "========================================="
+          echo "VIDEO + AUDIO API POLLING"
+          echo "========================================="
+          echo "Video API: ${{ inputs.video_url }}"
+          [ -n "${{ inputs.audio_url }}" ] && echo "Audio API: ${{ inputs.audio_url }}"
+          echo "Max wait: ${{ inputs.max_wait_time }} minutes"
+          echo ""
+          
+          CHECK_INTERVAL=5
+          MAX_WAIT=$(( ${{ inputs.max_wait_time }} * 60 ))
+          ELAPSED=0
+          
+          VIDEO_COMPLETED=false
+          AUDIO_COMPLETED=false
+          VIDEO_DOWNLOAD_URL=""
+          AUDIO_DOWNLOAD_URL=""
+          VIDEO_FILE_NAME=""
+          AUDIO_FILE_NAME=""
+          VIDEO_TITLE="video"
+          VIDEO_SIZE_BYTES=0
+          AUDIO_SIZE_BYTES=0
+          
+          mkdir -p "${{ inputs.output_folder }}"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          PROGRESS_LOG="${{ inputs.output_folder }}/progress_${TIMESTAMP}.log"
+          
+          echo "=== DOWNLOAD PROGRESS LOG ===" > "$PROGRESS_LOG"
+          echo "Start Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$PROGRESS_LOG"
+          echo "Video URL: ${{ inputs.video_url }}" >> "$PROGRESS_LOG"
+          [ -n "${{ inputs.audio_url }}" ] && echo "Audio URL: ${{ inputs.audio_url }}" >> "$PROGRESS_LOG"
+          echo "================================" >> "$PROGRESS_LOG"
+          echo "" >> "$PROGRESS_LOG"
+          
+          # Function to extract progress from various JSON formats
+          get_progress() {
+            local response="$1"
+            # Try different possible field names
+            local percent=$(echo "$response" | jq -r '.percent // .progress // .percentage // .complete // "0"')
+            # Handle string values like "Completed" or "100"
+            if [[ "$percent" == "Completed" ]] || [[ "$percent" == "complete" ]] || [[ "$percent" == "done" ]]; then
+              echo "100"
+            elif [[ "$percent" =~ ^[0-9]+$ ]]; then
+              echo "$percent"
+            else
+              echo "0"
+            fi
+          }
+          
+          # Function to check if completed
+          is_completed() {
+            local response="$1"
+            local status=$(echo "$response" | jq -r '.status // ""')
+            local percent=$(get_progress "$response")
+            
+            if [[ "$status" == "completed" ]] || [[ "$status" == "complete" ]] || [[ "$status" == "done" ]] || [[ "$percent" == "100" ]]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          
+          create_progress_bar() {
+            local percent=$1
+            local width=40
+            local filled=$(echo "scale=0; $percent * $width / 100" | bc 2>/dev/null || echo "0")
+            local empty=$((width - filled))
+            
+            # Use brackets and equals signs instead of pipe characters
+            local bar=""
+            for ((i=0; i<filled; i++)); do bar="${bar}="; done
+            for ((i=0; i<empty; i++)); do bar="${bar} "; done
+            
+            printf "[%s] %3d%%" "$bar" "$percent"
+          }
+          
+          echo "Starting polling (checking every ${CHECK_INTERVAL} seconds)..."
+          echo ""
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Poll Video API
+            VIDEO_RESPONSE=""
+            VIDEO_STATUS="processing"
+            VIDEO_PROGRESS=0
+            if [ "$VIDEO_COMPLETED" = false ]; then
+              VIDEO_RESPONSE=$(curl -s "${{ inputs.video_url }}" 2>/dev/null || echo "{}")
+              if echo "$VIDEO_RESPONSE" | jq empty 2>/dev/null; then
+                VIDEO_STATUS=$(echo "$VIDEO_RESPONSE" | jq -r '.status // "processing"')
+                VIDEO_PROGRESS=$(get_progress "$VIDEO_RESPONSE")
+                VIDEO_DOWNLOAD_URL=$(echo "$VIDEO_RESPONSE" | jq -r '.fileUrl // .downloadUrl // ""')
+                VIDEO_FILE_NAME=$(echo "$VIDEO_RESPONSE" | jq -r '.fileName // .filename // ""')
+                VIDEO_SIZE_BYTES=$(echo "$VIDEO_RESPONSE" | jq -r '.fileSizeBytes // .size // 0')
+                
+                if is_completed "$VIDEO_RESPONSE"; then
+                  VIDEO_COMPLETED=true
+                  echo "" >> "$PROGRESS_LOG"
+                  echo "[$(date '+%H:%M:%S')] ✅ VIDEO completed" >> "$PROGRESS_LOG"
+                  echo "   File: $VIDEO_FILE_NAME" >> "$PROGRESS_LOG"
+                  echo "   Size: $VIDEO_SIZE_BYTES bytes" >> "$PROGRESS_LOG"
+                  
+                  # Extract title from filename
+                  if [ -n "$VIDEO_FILE_NAME" ] && [ "$VIDEO_FILE_NAME" != "null" ]; then
+                    VIDEO_TITLE=$(echo "$VIDEO_FILE_NAME" | sed 's/\.[^.]*$//' | sed 's/[^a-zA-Z0-9]/_/g')
+                  fi
+                fi
+              fi
+            fi
+            
+            # Poll Audio API
+            AUDIO_STATUS="processing"
+            AUDIO_PROGRESS=0
+            if [ -n "${{ inputs.audio_url }}" ] && [ "$AUDIO_COMPLETED" = false ]; then
+              AUDIO_RESPONSE=$(curl -s "${{ inputs.audio_url }}" 2>/dev/null || echo "{}")
+              if echo "$AUDIO_RESPONSE" | jq empty 2>/dev/null; then
+                AUDIO_STATUS=$(echo "$AUDIO_RESPONSE" | jq -r '.status // "processing"')
+                AUDIO_PROGRESS=$(get_progress "$AUDIO_RESPONSE")
+                AUDIO_DOWNLOAD_URL=$(echo "$AUDIO_RESPONSE" | jq -r '.fileUrl // .downloadUrl // ""')
+                AUDIO_FILE_NAME=$(echo "$AUDIO_RESPONSE" | jq -r '.fileName // .filename // ""')
+                AUDIO_SIZE_BYTES=$(echo "$AUDIO_RESPONSE" | jq -r '.fileSizeBytes // .size // 0')
+                
+                if is_completed "$AUDIO_RESPONSE"; then
+                  AUDIO_COMPLETED=true
+                  echo "" >> "$PROGRESS_LOG"
+                  echo "[$(date '+%H:%M:%S')] ✅ AUDIO completed" >> "$PROGRESS_LOG"
+                  echo "   File: $AUDIO_FILE_NAME" >> "$PROGRESS_LOG"
+                fi
+              fi
+            elif [ -z "${{ inputs.audio_url }}" ]; then
+              AUDIO_COMPLETED=true  # No audio to download
+            fi
+            
+            # Build progress display without using pipe characters in printf format
+            VIDEO_BAR=$(create_progress_bar $VIDEO_PROGRESS)
+            
+            # Clear line and display progress using carriage return
+            if [ -n "${{ inputs.audio_url }}" ]; then
+              AUDIO_BAR=$(create_progress_bar $AUDIO_PROGRESS)
+              # Use echo with -n and carriage return instead of printf with special chars
+              echo -ne "\rVideo: $VIDEO_BAR  Audio: $AUDIO_BAR  [$(printf "%02d:%02d" $((ELAPSED/60)) $((ELAPSED%60)))]"
+            else
+              echo -ne "\rVideo: $VIDEO_BAR  [$(printf "%02d:%02d" $((ELAPSED/60)) $((ELAPSED%60)))]"
+            fi
+            
+            # Log progress every 30 seconds
+            if [ $((ELAPSED % 30)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+              echo "" >> "$PROGRESS_LOG"
+              echo "[$(date '+%H:%M:%S')] Video: ${VIDEO_PROGRESS}%, Audio: ${AUDIO_PROGRESS}%" >> "$PROGRESS_LOG"
+            fi
+            
+            # Check if both are completed
+            if [ "$VIDEO_COMPLETED" = true ] && [ "$AUDIO_COMPLETED" = true ]; then
+              echo ""
+              echo ""
+              echo "========================================="
+              echo "✅ BOTH VIDEO AND AUDIO COMPLETED!"
+              echo "========================================="
+              echo "Video: ${VIDEO_PROGRESS}% complete"
+              [ -n "${{ inputs.audio_url }}" ] && echo "Audio: ${AUDIO_PROGRESS}% complete"
+              break
+            fi
+            
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+          done
+          
+          echo "" >> "$PROGRESS_LOG"
+          echo "Final Status at $(date '+%Y-%m-%d %H:%M:%S'):" >> "$PROGRESS_LOG"
+          echo "  Video completed: $VIDEO_COMPLETED" >> "$PROGRESS_LOG"
+          echo "  Audio completed: $AUDIO_COMPLETED" >> "$PROGRESS_LOG"
+          
+          if [ "$VIDEO_COMPLETED" = false ]; then
+            echo ""
+            echo "❌ Video timeout reached after ${{ inputs.max_wait_time }} minutes"
+            exit 1
+          fi
+          
+          if [ -n "${{ inputs.audio_url }}" ] && [ "$AUDIO_COMPLETED" = false ]; then
+            echo "❌ Audio timeout reached after ${{ inputs.max_wait_time }} minutes"
+            exit 1
+          fi
+          
+          if [ -z "$VIDEO_DOWNLOAD_URL" ] || [ "$VIDEO_DOWNLOAD_URL" = "null" ]; then
+            echo "❌ No video download URL found in response"
+            echo "Last response: $VIDEO_RESPONSE"
+            exit 1
+          fi
+          
+          # Save to environment
+          echo "VIDEO_DOWNLOAD_URL=$VIDEO_DOWNLOAD_URL" >> $GITHUB_ENV
+          echo "VIDEO_TITLE=$VIDEO_TITLE" >> $GITHUB_ENV
+          echo "VIDEO_FILE_NAME=$VIDEO_FILE_NAME" >> $GITHUB_ENV
+          echo "VIDEO_SIZE_BYTES=$VIDEO_SIZE_BYTES" >> $GITHUB_ENV
+          echo "AUDIO_DOWNLOAD_URL=$AUDIO_DOWNLOAD_URL" >> $GITHUB_ENV
+          echo "AUDIO_FILE_NAME=$AUDIO_FILE_NAME" >> $GITHUB_ENV
+          echo "PROGRESS_LOG=$PROGRESS_LOG" >> $GITHUB_ENV
+          
+      - name: Download video file
+        run: |
+          echo "========================================="
+          echo "DOWNLOADING VIDEO FILE"
+          echo "========================================="
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          SAFE_TITLE=$(echo "$VIDEO_TITLE" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-100)
+          
+          if [ -n "$VIDEO_FILE_NAME" ] && [ "$VIDEO_FILE_NAME" != "null" ]; then
+            EXT="${VIDEO_FILE_NAME##*.}"
+            VIDEO_FILE="${{ inputs.output_folder }}/video_${SAFE_TITLE}_${TIMESTAMP}.${EXT}"
+          else
+            VIDEO_FILE="${{ inputs.output_folder }}/video_${SAFE_TITLE}_${TIMESTAMP}.mp4"
+          fi
+          
+          echo "Downloading from: $VIDEO_DOWNLOAD_URL"
+          echo "Output: $VIDEO_FILE"
+          echo ""
+          
+          curl -L "$VIDEO_DOWNLOAD_URL" \
+            -o "$VIDEO_FILE" \
+            --progress-bar \
+            --write-out "\nHTTP Status: %{http_code}\nTime: %{time_total}s\nSize: %{size_download} bytes\n" \
+            --max-time 600 \
+            --retry 3 \
+            --retry-delay 2
+          
+          if [ -f "$VIDEO_FILE" ]; then
+            ACTUAL_SIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || echo "0")
+            SIZE_HUMAN=$(du -h "$VIDEO_FILE" | cut -f1)
+            
+            echo ""
+            echo "✅ Video downloaded: $SIZE_HUMAN ($ACTUAL_SIZE bytes)"
+            echo "VIDEO_FILE=$VIDEO_FILE" >> $GITHUB_ENV
+            echo "VIDEO_ACTUAL_SIZE=$ACTUAL_SIZE" >> $GITHUB_ENV
+          else
+            echo "❌ Video download failed!"
+            exit 1
+          fi
+          
+      - name: Check if video already has audio
+        id: check_audio
+        if: inputs.audio_url != ''
+        run: |
+          echo "Checking video for existing audio stream..."
+          
+          AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null | wc -l)
+          
+          if [ "$AUDIO_STREAMS" -gt 0 ]; then
+            echo "✅ Video already has $AUDIO_STREAMS audio stream(s)"
+            echo "SKIP_MERGE=true" >> $GITHUB_ENV
+          else
+            echo "⚠️ Video has NO audio - will merge with provided audio"
+            echo "SKIP_MERGE=false" >> $GITHUB_ENV
+          fi
+          
+      - name: Download audio file
+        if: inputs.audio_url != '' && env.SKIP_MERGE != 'true'
+        run: |
+          echo "========================================="
+          echo "DOWNLOADING AUDIO FILE"
+          echo "========================================="
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          
+          if [ -n "$AUDIO_FILE_NAME" ] && [ "$AUDIO_FILE_NAME" != "null" ]; then
+            EXT="${AUDIO_FILE_NAME##*.}"
+            AUDIO_FILE="${{ inputs.output_folder }}/audio_${TIMESTAMP}.${EXT}"
+          else
+            AUDIO_FILE="${{ inputs.output_folder }}/audio_${TIMESTAMP}.mp3"
+          fi
+          
+          echo "Downloading from: $AUDIO_DOWNLOAD_URL"
+          echo "Output: $AUDIO_FILE"
+          echo ""
+          
+          curl -L "$AUDIO_DOWNLOAD_URL" \
+            -o "$AUDIO_FILE" \
+            --progress-bar \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 2
+          
+          if [ -f "$AUDIO_FILE" ]; then
+            AUDIO_SIZE=$(stat -c%s "$AUDIO_FILE" 2>/dev/null || echo "0")
+            AUDIO_SIZE_HUMAN=$(du -h "$AUDIO_FILE" | cut -f1)
+            
+            echo ""
+            echo "✅ Audio downloaded: $AUDIO_SIZE_HUMAN ($AUDIO_SIZE bytes)"
+            echo "AUDIO_FILE=$AUDIO_FILE" >> $GITHUB_ENV
+          else
+            echo "❌ Audio download failed!"
+            exit 1
+          fi
+          
+      - name: Merge video and audio with FFmpeg
+        if: inputs.audio_url != '' && env.SKIP_MERGE != 'true'
+        run: |
+          echo "========================================="
+          echo "MERGING VIDEO AND AUDIO"
+          echo "========================================="
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          SAFE_TITLE=$(echo "$VIDEO_TITLE" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-100)
+          OUTPUT_FILE="${{ inputs.output_folder }}/${SAFE_TITLE}_merged_${TIMESTAMP}.mp4"
+          
+          echo "Input Video: $VIDEO_FILE"
+          echo "Input Audio: $AUDIO_FILE"
+          echo "Output: $OUTPUT_FILE"
+          echo ""
+          
+          # Get durations
+          VIDEO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
+          AUDIO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE" 2>/dev/null)
+          echo "Video duration: ${VIDEO_DUR}s"
+          echo "Audio duration: ${AUDIO_DUR}s"
+          echo ""
+          
+          # Merge
+          ffmpeg -i "$VIDEO_FILE" -i "$AUDIO_FILE" \
+            -c:v copy \
+            -c:a aac -b:a 192k \
+            -map 0:v:0 -map 1:a:0 \
+            -shortest \
+            -movflags +faststart \
+            "$OUTPUT_FILE" -y 2>&1 | tee ffmpeg_log.txt | grep -E "(frame=|Error|Duration)" || true
+          
+          if [ $? -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
+            FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
+            FINAL_SIZE_HUMAN=$(du -h "$OUTPUT_FILE" | cut -f1)
+            
+            echo ""
+            echo "========================================="
+            echo "✅ MERGE COMPLETE!"
+            echo "========================================="
+            echo "Output: $OUTPUT_FILE"
+            echo "Size: $FINAL_SIZE_HUMAN ($FINAL_SIZE bytes)"
+            
+            echo "FINAL_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
+            echo "FINAL_SIZE=$FINAL_SIZE" >> $GITHUB_ENV
+            echo "FINAL_SIZE_HUMAN=$FINAL_SIZE_HUMAN" >> $GITHUB_ENV
+            
+            # Cleanup
+            rm -f "$VIDEO_FILE" "$AUDIO_FILE"
+          else
+            echo "❌ Merge failed!"
+            echo "FINAL_FILE=$VIDEO_FILE" >> $GITHUB_ENV
+            echo "FINAL_SIZE=$VIDEO_ACTUAL_SIZE" >> $GITHUB_ENV
+            exit 1
+          fi
+          
+      - name: Set final file for non-audio case
+        if: inputs.audio_url == '' || env.SKIP_MERGE == 'true'
+        run: |
+          echo "FINAL_FILE=$VIDEO_FILE" >> $GITHUB_ENV
+          echo "FINAL_SIZE=$VIDEO_ACTUAL_SIZE" >> $GITHUB_ENV
+          FINAL_SIZE_HUMAN=$(du -h "$VIDEO_FILE" | cut -f1)
+          echo "FINAL_SIZE_HUMAN=$FINAL_SIZE_HUMAN" >> $GITHUB_ENV
+          
+      - name: Create checksums
+        run: |
+          echo "Creating checksums for final file..."
+          
+          FINAL_FILE="$FINAL_FILE"
+          MD5_HASH=$(md5sum "$FINAL_FILE" | cut -d' ' -f1)
+          SHA256_HASH=$(sha256sum "$FINAL_FILE" | cut -d' ' -f1)
+          
+          echo "$MD5_HASH" > "${FINAL_FILE}.md5"
+          echo "$SHA256_HASH" > "${FINAL_FILE}.sha256"
+          
+          echo "FINAL_FILE_MD5=$MD5_HASH" >> $GITHUB_ENV
+          echo "FINAL_FILE_SHA256=$SHA256_HASH" >> $GITHUB_ENV
+          
+          echo "✅ MD5: $MD5_HASH"
+          echo "✅ SHA256: $SHA256_HASH"
+          
+      - name: Create metadata
+        run: |
+          cat > "${FINAL_FILE}.meta.json" << EOF
+          {
+            "video_api_url": "${{ inputs.video_url }}",
+            "audio_api_url": "${{ inputs.audio_url }}",
+            "title": "$VIDEO_TITLE",
+            "download_date": "$(date -u +"%Y-%m-%d %H:%M:%S UTC")",
+            "file_size": "$FINAL_SIZE_HUMAN",
+            "file_size_bytes": $FINAL_SIZE,
+            "md5": "$FINAL_FILE_MD5",
+            "sha256": "$FINAL_FILE_SHA256",
+            "has_audio": "${{ inputs.audio_url != '' }}",
+            "merged": "${{ inputs.audio_url != '' && env.SKIP_MERGE != 'true' }}"
+          }
+          EOF
+          
+          echo "✅ Metadata created"
+          
+      - name: Split large file into parts (1-indexed numbering)
+        id: split
+        if: env.FINAL_SIZE > 104857600  # 100MB
+        run: |
+          echo "========================================="
+          echo "FILE EXCEEDS 100MB - SPLITTING"
+          echo "========================================="
+          echo "File size: $FINAL_SIZE_HUMAN"
+          echo "Splitting into 95MB parts..."
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          PARTS_DIR="${{ inputs.output_folder }}/parts_${TIMESTAMP}"
+          mkdir -p "$PARTS_DIR"
+          
+          BASENAME=$(basename "$FINAL_FILE")
+          BASENAME_NOEXT="${BASENAME%.*}"
+          
+          # Copy file to parts directory
+          cp "$FINAL_FILE" "${PARTS_DIR}/"
+          
+          # Split with 3-digit zero-padded numbering starting from 001
+          cd "$PARTS_DIR"
+          split -b 95M -d -a 3 "$BASENAME" "${BASENAME_NOEXT}.part."
+          
+          # Rename part000 to part001, part001 to part002, etc.
+          for f in ${BASENAME_NOEXT}.part.*; do
+            if [ -f "$f" ]; then
+              OLD_NUM=$(echo "$f" | grep -o '[0-9]*$')
+              NEW_NUM=$((10#$OLD_NUM + 1))
+              NEW_NUM_PADDED=$(printf "%03d" $NEW_NUM)
+              NEW_NAME="${BASENAME_NOEXT}.part${NEW_NUM_PADDED}"
+              mv "$f" "$NEW_NAME"
+              echo "Renamed: $(basename "$f") -> $NEW_NAME"
+            fi
+          done
+          
+          # Remove original file
+          rm -f "$BASENAME"
+          
+          # Count parts
+          PART_COUNT=$(ls -1 ${BASENAME_NOEXT}.part* 2>/dev/null | wc -l)
+          echo "Created $PART_COUNT parts"
+          
+          # Create checksums
+          md5sum ${BASENAME_NOEXT}.part* > checksums.md5
+          sha256sum ${BASENAME_NOEXT}.part* > checksums.sha256
+          
+          # Create reassembly scripts
+          cat > reassemble.sh << 'EOF'
+          #!/bin/bash
+          echo "========================================="
+          echo "REASSEMBLING VIDEO FILE"
+          echo "========================================="
+          
+          # Find all part files and sort numerically
+          PARTS=$(ls -1 *.part[0-9][0-9][0-9] 2>/dev/null | sort -V)
+          
+          if [ -z "$PARTS" ]; then
+            echo "❌ No part files found"
+            exit 1
+          fi
+          
+          BASENAME=$(echo "$PARTS" | head -1 | sed 's/\.part[0-9]*$//')
+          echo "Found base name: $BASENAME"
+          echo "Parts: $(echo "$PARTS" | wc -l) files"
+          echo ""
+          
+          # Verify checksums if available
+          if [ -f checksums.md5 ]; then
+            echo "Verifying checksums..."
+            if md5sum -c checksums.md5 --quiet 2>/dev/null; then
+              echo "✅ Checksums verified"
+            else
+              echo "⚠️ Checksum warning, continuing..."
+            fi
+          fi
+          
+          echo "Reassembling $BASENAME..."
+          cat ${BASENAME}.part* > "$BASENAME"
+          
+          if [ -f "$BASENAME" ]; then
+            echo ""
+            echo "========================================="
+            echo "✅ REASSEMBLY COMPLETE!"
+            echo "========================================="
+            echo "File: $BASENAME"
+            echo "Size: $(du -h "$BASENAME" | cut -f1)"
+            
+            # Verify final file
+            if [ -f "${BASENAME}.md5" ]; then
+              if md5sum -c "${BASENAME}.md5" --quiet 2>/dev/null; then
+                echo "✅ Final file verified!"
+              fi
+            fi
+          else
+            echo "❌ Reassembly failed!"
+            exit 1
+          fi
+          EOF
+          
+          cat > reassemble.bat << 'EOF'
+          @echo off
+          echo =========================================
+          echo REASSEMBLING VIDEO FILE
+          echo =========================================
+          setlocal enabledelayedexpansion
+          
+          set BASENAME=
+          for %%f in (*.part???) do (
+              set "BASENAME=%%~nf"
+              set "BASENAME=!BASENAME:.part=!"
+              goto :found
+          )
+          :found
+          
+          if "%BASENAME%"=="" (
+              echo Error: No part files found
+              exit /b 1
+          )
+          
+          echo Found base name: %BASENAME%
+          echo.
+          echo Reassembling %BASENAME%...
+          copy /b %BASENAME%.part* %BASENAME%
+          
+          if exist "%BASENAME%" (
+              echo.
+              echo =========================================
+              echo REASSEMBLY COMPLETE!
+              echo =========================================
+              echo File: %BASENAME%
+          ) else (
+              echo Reassembly failed!
+              exit /b 1
+          )
+          EOF
+          
+          chmod +x reassemble.sh
+          
+          # Copy metadata and checksums
+          cp "../${BASENAME_NOEXT}.md5" . 2>/dev/null || true
+          cp "../${BASENAME_NOEXT}.sha256" . 2>/dev/null || true
+          cp "../${BASENAME_NOEXT}.meta.json" . 2>/dev/null || true
+          
+          cd -
+          
+          echo "TOTAL_PARTS=$PART_COUNT" >> $GITHUB_ENV
+          echo "PARTS_DIR=$PARTS_DIR" >> $GITHUB_ENV
+          echo "BASENAME_NOEXT=$BASENAME_NOEXT" >> $GITHUB_ENV
+          
+      # Push files one by one to repository
+      - name: Push files one by one
+        run: |
+          echo "========================================="
+          echo "PUSHING FILES ONE BY ONE"
+          echo "========================================="
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Function to push a single file
+          push_file() {
+            local file="$1"
+            local commit_msg="$2"
+            
+            if [ -f "$file" ] || [ -d "$file" ]; then
+              echo ""
+              echo "📤 Pushing: $file"
+              git add "$file"
+              git commit -m "$commit_msg" || echo "No changes to commit for $file"
+              git push origin HEAD:${{ github.ref_name }}
+              echo "✅ Pushed: $file"
+              sleep 2  # Small delay to avoid rate limiting
+            else
+              echo "⚠️ File not found: $file"
+            fi
+          }
+          
+          # Push progress log first
+          push_file "$PROGRESS_LOG" "Add progress log for video download"
+          
+          # Push checksum files
+          push_file "${FINAL_FILE}.md5" "Add MD5 checksum for video"
+          push_file "${FINAL_FILE}.sha256" "Add SHA256 checksum for video"
+          push_file "${FINAL_FILE}.meta.json" "Add metadata for video"
+          
+          # Handle split parts or final file
+          if [ -n "$PARTS_DIR" ]; then
+            # Push reassembly scripts first
+            push_file "${PARTS_DIR}/reassemble.sh" "Add reassembly script (Linux/Mac)"
+            push_file "${PARTS_DIR}/reassemble.bat" "Add reassembly script (Windows)"
+            push_file "${PARTS_DIR}/checksums.md5" "Add parts checksums MD5"
+            push_file "${PARTS_DIR}/checksums.sha256" "Add parts checksums SHA256"
+            
+            # Push each part file individually
+            echo ""
+            echo "📦 Pushing $TOTAL_PARTS part files individually..."
+            PART_NUM=1
+            for part_file in ${PARTS_DIR}/${BASENAME_NOEXT}.part*; do
+              if [ -f "$part_file" ]; then
+                PART_NAME=$(basename "$part_file")
+                push_file "$part_file" "Add video part $PART_NUM/$TOTAL_PARTS: $PART_NAME"
+                PART_NUM=$((PART_NUM + 1))
+              fi
+            done
+          else
+            # Push the final video file
+            push_file "$FINAL_FILE" "Add downloaded video file: $VIDEO_TITLE"
+          fi
+          
+          echo ""
+          echo "========================================="
+          echo "✅ ALL FILES PUSHED SUCCESSFULLY!"
+          echo "========================================="
+          
+          # List all pushed files
+          echo ""
+          echo "Files in repository:"
+          if [ -n "$PARTS_DIR" ]; then
+            echo "Parts directory: $PARTS_DIR/"
+            ls -la "$PARTS_DIR/"
+          else
+            ls -la "${{ inputs.output_folder }}/"
+          fi
+          
+      - name: Create workflow summary
+        if: always()
+        run: |
+          echo "## ✅ Download Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Video API** | \`${{ inputs.video_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.audio_url }}" ]; then
+            echo "| **Audio API** | \`${{ inputs.audio_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| **Final Size** | ${{ env.FINAL_SIZE_HUMAN }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Output Folder** | \`${{ inputs.output_folder }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ env.PARTS_DIR }}" ]; then
+            echo "### 📦 Split into ${{ env.TOTAL_PARTS }} parts" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Location:** \`${{ env.PARTS_DIR }}/\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Files pushed:**" >> $GITHUB_STEP_SUMMARY
+            echo "- reassemble.sh" >> $GITHUB_STEP_SUMMARY
+            echo "- reassemble.bat" >> $GITHUB_STEP_SUMMARY
+            echo "- checksums.md5" >> $GITHUB_STEP_SUMMARY
+            echo "- checksums.sha256" >> $GITHUB_STEP_SUMMARY
+            echo "- ${{ env.TOTAL_PARTS }} part files (.part001, .part002, ...)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Reassembly Instructions:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Navigate to the parts directory" >> $GITHUB_STEP_SUMMARY
+            echo "2. Run \`./reassemble.sh\` (Linux/Mac) or \`reassemble.bat\` (Windows)" >> $GITHUB_STEP_SUMMARY
+            echo "3. The original file will be reconstructed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📁 File Location" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The video file has been saved to: \`${{ env.FINAL_FILE }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Associated files:**" >> $GITHUB_STEP_SUMMARY
+            echo "- \`$(basename "${{ env.FINAL_FILE }}.md5")\` - MD5 checksum" >> $GITHUB_STEP_SUMMARY
+            echo "- \`$(basename "${{ env.FINAL_FILE }}.sha256")\` - SHA256 checksum" >> $GITHUB_STEP_SUMMARY
+            echo "- \`$(basename "${{ env.FINAL_FILE }}.meta.json")\` - Metadata" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 View Files" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "You can browse the files in the [repository](${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${{ inputs.output_folder }})" >> $GITHUB_STEP_SUMMARY
