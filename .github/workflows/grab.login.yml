@@ -1,0 +1,348 @@
+name: GRAB Complete Dataset Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'GRAB Username (email)'
+        required: true
+        type: string
+        default: 'jamshid.bahrami@alumni.um.ac.ir'
+      password:
+        description: 'GRAB Password'
+        required: true
+        type: string
+      download_section:
+        description: 'What to download'
+        required: true
+        type: choice
+        options:
+          - everything
+          - grab_dataset_only
+          - grabnet_dataset_only
+          - custom_selection
+      include_preview_videos:
+        description: 'Include preview videos (renders_preview.zip ~9.4GB)'
+        required: false
+        type: boolean
+        default: false
+      include_raw_mocap:
+        description: 'Include Raw VICON MoCap files (C3D format, ~2.5GB total)'
+        required: false
+        type: boolean
+        default: false
+      include_object_meshes:
+        description: 'Include object meshes (requires license acceptance)'
+        required: false
+        type: boolean
+        default: false
+      push_to_repo:
+        description: 'Push files to repository?'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  download-all:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Login and download complete GRAB dataset
+        env:
+          USERNAME: ${{ github.event.inputs.username }}
+          PASSWORD: ${{ github.event.inputs.password }}
+          INCLUDE_PREVIEW: ${{ github.event.inputs.include_preview_videos }}
+          INCLUDE_MOCAP: ${{ github.event.inputs.include_raw_mocap }}
+          INCLUDE_OBJECTS: ${{ github.event.inputs.include_object_meshes }}
+        shell: bash
+        run: |
+          # Create timestamped folder
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          DOWNLOAD_DIR="grab_complete_${TIMESTAMP}"
+          mkdir -p "$DOWNLOAD_DIR"
+          cd "$DOWNLOAD_DIR"
+          
+          # Login and save session
+          echo "Logging in..."
+          curl -L -c cookies.txt -b cookies.txt \
+            -d "username=$USERNAME" \
+            -d "password=$PASSWORD" \
+            -d "commit=Log in" \
+            https://grab.is.tue.mpg.de/login.php -o login_response.html
+          
+          # Verify login
+          if grep -q "logout" login_response.html; then
+            echo "✓ Login successful"
+          else
+            echo "✗ Login failed"
+            cat login_response.html
+            exit 1
+          fi
+          
+          # Function to download with proper session
+          download_file() {
+            local url="$1"
+            local output="$2"
+            local max_retries=3
+            local retry_delay=5
+            
+            for i in $(seq 1 $max_retries); do
+              echo "Downloading $output (attempt $i/$max_retries)..."
+              
+              # Use the session cookies and follow redirects
+              curl -L -b cookies.txt -c cookies.txt \
+                -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+                -H "Referer: https://grab.is.tue.mpg.de/" \
+                -o "$output.tmp" \
+                -w "%{http_code}" \
+                "$url" > http_code.txt
+              
+              http_code=$(cat http_code.txt)
+              
+              if [ "$http_code" = "200" ]; then
+                # Check if it's a real zip file or HTML error
+                if file "$output.tmp" | grep -q "Zip archive"; then
+                  mv "$output.tmp" "$output"
+                  local size=$(du -h "$output" | cut -f1)
+                  echo "✓ Successfully downloaded $output (size: $size, HTTP: $http_code)"
+                  return 0
+                elif [ -s "$output.tmp" ] && [ $(wc -l < "$output.tmp") -gt 5 ]; then
+                  # Might be HTML error, check content
+                  if grep -q "Error\|404\|Forbidden\|denied" "$output.tmp"; then
+                    echo "✗ Server error for $output:"
+                    head -5 "$output.tmp"
+                    rm -f "$output.tmp"
+                  else
+                    mv "$output.tmp" "$output"
+                    echo "⚠ Downloaded but not a zip file: $output"
+                    return 0
+                  fi
+                else
+                  echo "✗ Failed to download $output (HTTP: $http_code)"
+                  rm -f "$output.tmp"
+                fi
+              else
+                echo "✗ HTTP error $http_code for $output"
+                rm -f "$output.tmp"
+              fi
+              
+              echo "Retrying in ${retry_delay}s..."
+              sleep $retry_delay
+            done
+            
+            echo "✗ Failed to download $output after $max_retries attempts"
+            return 1
+          }
+          
+          # Download based on section
+          if [ "${{ github.event.inputs.download_section }}" = "everything" ] || [ "${{ github.event.inputs.download_section }}" = "grab_dataset_only" ]; then
+            echo "=== Downloading GRAB Dataset Files ==="
+            
+            # GRAB parameters (always download these - the main data)
+            echo "--- Downloading GRAB parameters (required) ---"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=grab__s${i}.zip" "grab__s${i}.zip"
+            done
+            
+            # Raw VICON MoCap (optional - only if enabled)
+            if [ "$INCLUDE_MOCAP" = "true" ]; then
+              echo "--- Downloading Raw VICON MoCap files (optional) ---"
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=mocap__s${i}.zip" "mocap__s${i}.zip"
+              done
+            else
+              echo "--- Skipping Raw VICON MoCap files (disabled) ---"
+              echo "To download them, set include_raw_mocap: true"
+            fi
+            
+            # Preview videos (optional)
+            if [ "$INCLUDE_PREVIEW" = "true" ]; then
+              echo "--- Downloading preview videos (optional) ---"
+              download_file "https://owncloud.tuebingen.mpg.de/index.php/s/NjjifEy3QL7KLX6/download" "renders_preview.zip"
+            else
+              echo "--- Skipping preview videos (disabled) ---"
+            fi
+            
+            # Tools and templates (always download - small files)
+            echo "--- Downloading tools and templates ---"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__subject_meshes__female.zip" "tools__subject_meshes__female.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__subject_meshes__male.zip" "tools__subject_meshes__male.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__smplx_correspondence.zip" "tools__smplx_correspondence.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__object_settings.zip" "tools__object_settings.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__subject_settings.zip" "tools__subject_settings.zip"
+            
+            # Object meshes (optional - requires license)
+            if [ "$INCLUDE_OBJECTS" = "true" ]; then
+              echo "--- Downloading object meshes (requires license) ---"
+              download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=contactdb_scaled_stl_files_public.zip" "contactdb_objects.zip"
+              
+              # Try to get GRAB object meshes (may require additional license acceptance)
+              for obj_file in "grab_objects.zip" "objects.zip" "grab_object_meshes.zip" "tools__object_meshes.zip"; do
+                if download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=${obj_file}" "${obj_file}" 2>/dev/null; then
+                  if [ -f "${obj_file}" ] && file "${obj_file}" | grep -q "Zip archive"; then
+                    echo "✓ Downloaded object meshes: ${obj_file}"
+                    break
+                  fi
+                fi
+              done
+            else
+              echo "--- Skipping object meshes (disabled) ---"
+            fi
+          fi
+          
+          if [ "${{ github.event.inputs.download_section }}" = "everything" ] || [ "${{ github.event.inputs.download_section }}" = "grabnet_dataset_only" ]; then
+            echo "=== Downloading GrabNet Dataset Files ==="
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__train__data__s${i}.zip" "grabnet_train_s${i}.zip"
+              download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__val__data__s${i}.zip" "grabnet_val_s${i}.zip"
+              download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__test__data__s${i}.zip" "grabnet_test_s${i}.zip"
+            done
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=models.zip" "grabnet_models.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__train__frame_names.zip" "grabnet_train_frame_ids.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__val__frame_names.zip" "grabnet_val_frame_ids.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__test__frame_names.zip" "grabnet_test_frame_ids.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__train__grabnet_train.zip" "grabnet_train_poses.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__val__grabnet_val.zip" "grabnet_val_poses.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__test__grabnet_test.zip" "grabnet_test_poses.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=grab__objects_info.zip" "grabnet_objects_info.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__sbj_info.zip" "grabnet_subjects_info.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=tools__subject_meshes.zip" "grabnet_hand_shapes.zip"
+            download_file "https://download.is.tue.mpg.de/download.php?domain=grab&sfile=data__bps.zip" "grabnet_bps_reference.zip"
+          fi
+          
+          echo "Download complete!"
+          echo "Files in directory:"
+          ls -lh *.zip 2>/dev/null || echo "No zip files found"
+          
+          # Check actual file types
+          echo -e "\nVerifying downloaded files:"
+          for file in *.zip; do
+            if [ -f "$file" ]; then
+              echo -n "$file: "
+              file "$file" | head -1
+            fi
+          done
+          
+          # Calculate total size
+          TOTAL_SIZE=$(du -sh . 2>/dev/null | cut -f1)
+          
+          # Create manifest using printf to avoid YAML issues
+          printf '%s\n' \
+            "# Complete GRAB Dataset Download" \
+            "" \
+            "**Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" \
+            "**Section:** ${{ github.event.inputs.download_section }}" \
+            "**Preview videos included:** ${INCLUDE_PREVIEW}" \
+            "**Raw VICON MoCap included:** ${INCLUDE_MOCAP}" \
+            "**Object meshes included:** ${INCLUDE_OBJECTS}" \
+            "**Total size:** ${TOTAL_SIZE}" \
+            "" \
+            "## Downloaded Files:" \
+            "" > MANIFEST.md
+          
+          ls -lh *.zip 2>/dev/null | awk '{print "- " $9 ": " $5}' >> MANIFEST.md
+          
+          printf '\n## What was NOT downloaded:\n' >> MANIFEST.md
+          if [ "$INCLUDE_MOCAP" != "true" ]; then
+            echo "- Raw VICON MoCap files (mocap__s*.zip) - set include_raw_mocap: true to download" >> MANIFEST.md
+          fi
+          if [ "$INCLUDE_PREVIEW" != "true" ]; then
+            echo "- Preview videos (renders_preview.zip) - set include_preview_videos: true to download" >> MANIFEST.md
+          fi
+          if [ "$INCLUDE_OBJECTS" != "true" ]; then
+            echo "- Object meshes - set include_object_meshes: true to download" >> MANIFEST.md
+          fi
+          
+          printf '\n## Estimated sizes if downloading everything:\n' >> MANIFEST.md
+          printf -- '- GRAB parameters (10 subjects): ~3.6 GB\n' >> MANIFEST.md
+          printf -- '- Raw VICON MoCap (10 subjects): ~2.4 GB (not downloaded)\n' >> MANIFEST.md
+          printf -- '- Preview videos: ~9.4 GB (not downloaded)\n' >> MANIFEST.md
+          printf -- '- Tools and templates: ~3 MB\n' >> MANIFEST.md
+          printf -- '- GrabNet dataset: ~2 GB\n' >> MANIFEST.md
+          
+          cd ..
+      
+      - name: Split and push files one by one
+        if: github.event.inputs.push_to_repo == 'true'
+        shell: bash
+        run: |
+          DOWNLOAD_DIR=$(ls -d grab_complete_* 2>/dev/null | head -1)
+          if [ ! -d "$DOWNLOAD_DIR" ]; then
+            echo "No download directory found"
+            exit 1
+          fi
+          
+          cd "$DOWNLOAD_DIR"
+          
+          # Function to push a single file
+          push_file() {
+            local file_to_push=$1
+            echo "Processing: $file_to_push"
+            git add "$file_to_push"
+            cd ..
+            git commit -m "Add ${file_to_push} [skip ci]" || true
+            git push origin HEAD:$(echo ${GITHUB_REF#refs/heads/})
+            cd "$DOWNLOAD_DIR"
+            echo "✓ Pushed: $file_to_push"
+          }
+          
+          # Process zip files
+          for file in *.zip; do
+            if [ -f "$file" ] && [ "$(file "$file" | grep -c 'Zip archive')" -gt 0 ]; then
+              file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+              
+              if [ "$file_size" -gt 104857600 ]; then
+                echo "Splitting $file (${file_size} bytes)..."
+                split -b 95M "$file" "${file}.part."
+                
+                # Save checksums
+                md5sum "$file" > "${file}.md5"
+                sha256sum "$file" > "${file}.sha256"
+                
+                # Push each part
+                for part in ${file}.part.*; do
+                  if [ -f "$part" ]; then
+                    push_file "$part"
+                  fi
+                done
+                
+                # Push checksums
+                push_file "${file}.md5"
+                push_file "${file}.sha256"
+                
+                # Create reassembly script
+                printf '#!/bin/bash\n' > "reassemble_${file}.sh"
+                printf 'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n' >> "reassemble_${file}.sh"
+                printf 'cd "$SCRIPT_DIR"\n' >> "reassemble_${file}.sh"
+                printf 'cat ${1}.part.* > ${1}\n' >> "reassemble_${file}.sh"
+                printf 'echo "✓ Reassembled ${1}"\n' >> "reassemble_${file}.sh"
+                printf 'md5sum -c ${1}.md5 2>/dev/null || sha256sum -c ${1}.sha256\n' >> "reassemble_${file}.sh"
+                
+                chmod +x "reassemble_${file}.sh"
+                push_file "reassemble_${file}.sh"
+                
+                rm "$file"
+              else
+                push_file "$file"
+              fi
+            fi
+          done
+          
+          # Push documentation
+          [ -f "MANIFEST.md" ] && push_file "MANIFEST.md"
+          [ -f "cookies.txt" ] && push_file "cookies.txt"
+          
+          cd ..
+          echo "All files pushed successfully!"
