@@ -1,0 +1,318 @@
+name: AMASS Dataset Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'MPG Username (email)'
+        required: true
+        type: string
+        default: 'jamshid.bahrami@alumni.um.ac.ir'
+      password:
+        description: 'MPG Password'
+        required: true
+        type: string
+      download_url:
+        description: 'AMASS download page URL'
+        required: true
+        type: string
+        default: 'https://amass.is.tue.mpg.de/download.php'
+      exclude_renders:
+        description: 'Exclude render files?'
+        required: false
+        type: boolean
+        default: true
+      push_to_repo:
+        description: 'Push files to repository?'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  download-amass-datasets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Login and download AMASS datasets
+        env:
+          USERNAME: ${{ github.event.inputs.username }}
+          PASSWORD: ${{ github.event.inputs.password }}
+          DOWNLOAD_URL: ${{ github.event.inputs.download_url }}
+          EXCLUDE_RENDERS: ${{ github.event.inputs.exclude_renders }}
+        shell: bash
+        run: |
+          # Extract base URL
+          BASE_URL=$(echo "$DOWNLOAD_URL" | grep -oE 'https?://[^/]+')
+          
+          echo "Base URL: $BASE_URL"
+          echo "Exclude Renders: $EXCLUDE_RENDERS"
+          
+          # Create download directory
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          DOWNLOAD_DIR="amass_datasets_${TIMESTAMP}"
+          mkdir -p "$DOWNLOAD_DIR"
+          cd "$DOWNLOAD_DIR"
+          
+          # Login and save session
+          LOGIN_URL="${BASE_URL}/login.php"
+          
+          echo "Logging in to ${BASE_URL}..."
+          curl -s -L -c cookies.txt -b cookies.txt \
+            -d "username=$USERNAME" \
+            -d "password=$PASSWORD" \
+            -d "commit=Log in" \
+            "$LOGIN_URL" -o login_response.html
+          
+          # Verify login
+          if grep -q -i "logout" login_response.html; then
+            echo "✓ Login successful"
+          else
+            echo "✗ Login failed"
+            cat login_response.html
+            exit 1
+          fi
+          
+          # Download the main page
+          echo "Downloading main page..."
+          curl -s -L -b cookies.txt -c cookies.txt \
+            -H "User-Agent: Mozilla/5.0" \
+            -o download_page.html \
+            "$DOWNLOAD_URL"
+          
+          # Extract all download links from onclick handlers and hrefs
+          echo "Extracting download links..."
+          
+          # Method 1: Extract from onclick="openModalLicense('URL', ...)"
+          grep -oP "openModalLicense\('\K[^']+" download_page.html > links_onclick.txt 2>/dev/null || true
+          
+          # Method 2: Extract from href="URL" for download links
+          grep -oP 'href="\Khttps://download\.is\.tue\.mpg\.de/download\.php[^"]+' download_page.html >> links_onclick.txt 2>/dev/null || true
+          
+          # Combine and deduplicate
+          cat links_onclick.txt | sort -u > all_links.txt
+          
+          # Filter out renders if requested
+          if [ "$EXCLUDE_RENDERS" = "true" ]; then
+            grep -v -i "render" all_links.txt > links.txt
+          else
+            cp all_links.txt links.txt
+          fi
+          
+          total_links=$(wc -l < links.txt)
+          echo "Found $total_links files to download"
+          
+          if [ $total_links -eq 0 ]; then
+            echo "No links found! Debugging:"
+            echo "First 50 lines of download_page.html:"
+            head -50 download_page.html
+            exit 1
+          fi
+          
+          echo "Sample links:"
+          head -3 links.txt
+          
+          # Function to extract filename from URL
+          get_filename() {
+            local url="$1"
+            local filename=""
+            
+            # Extract sfile parameter
+            if [[ "$url" =~ sfile=([^&]+) ]]; then
+              filename="${BASH_REMATCH[1]}"
+              filename=$(echo "$filename" | sed 's/%2F/\//g' | rev | cut -d'/' -f1 | rev)
+            fi
+            
+            # Extract file parameter
+            if [ -z "$filename" ] && [[ "$url" =~ file=([^&]+) ]]; then
+              filename="${BASH_REMATCH[1]}"
+              filename=$(echo "$filename" | sed 's/%2F/\//g' | rev | cut -d'/' -f1 | rev)
+            fi
+            
+            # Default name
+            if [ -z "$filename" ]; then
+              filename="download_$(echo "$url" | md5sum | cut -d' ' -f1).tar.bz2"
+            fi
+            
+            echo "$filename"
+          }
+          
+          # Function to download with retry
+          download_file() {
+            local url="$1"
+            local output="$2"
+            local max_retries=3
+            local retry_delay=10
+            
+            # URL encode the URL properly
+            encoded_url=$(echo "$url" | sed 's/&amp;/\&/g')
+            
+            for i in $(seq 1 $max_retries); do
+              echo "  Attempt $i/$max_retries..."
+              
+              http_code=$(curl -L -b cookies.txt -c cookies.txt \
+                -H "User-Agent: Mozilla/5.0" \
+                -H "Referer: ${BASE_URL}/" \
+                -o "$output.part" \
+                -C - \
+                --connect-timeout 30 \
+                --max-time 3600 \
+                -w "%{http_code}" \
+                "$encoded_url")
+              
+              if [ "$http_code" = "200" ] || [ "$http_code" = "206" ]; then
+                if [ -f "$output.part" ] && [ -s "$output.part" ]; then
+                  mv "$output.part" "$output"
+                  size=$(du -h "$output" | cut -f1)
+                  echo "  ✓ Downloaded: $output (size: $size)"
+                  return 0
+                fi
+              else
+                echo "  ✗ HTTP error $http_code"
+                rm -f "$output.part" 2>/dev/null || true
+              fi
+              
+              if [ $i -lt $max_retries ]; then
+                echo "  Retrying in ${retry_delay}s..."
+                sleep $retry_delay
+              fi
+            done
+            
+            echo "  ✗ Failed to download after $max_retries attempts"
+            return 1
+          }
+          
+          # Download each file
+          echo ""
+          echo "Starting downloads..."
+          echo "======================"
+          
+          successful=0
+          failed=0
+          current=0
+          
+          while IFS= read -r link; do
+            current=$((current + 1))
+            filename=$(get_filename "$link")
+            
+            echo ""
+            echo "[$current/$total_links] Downloading: $filename"
+            
+            if [ -f "$filename" ]; then
+              echo "  File already exists, skipping..."
+              successful=$((successful + 1))
+              continue
+            fi
+            
+            if download_file "$link" "$filename"; then
+              successful=$((successful + 1))
+              # Calculate checksums
+              md5sum "$filename" > "${filename}.md5" 2>/dev/null || true
+              sha256sum "$filename" > "${filename}.sha256" 2>/dev/null || true
+            else
+              failed=$((failed + 1))
+              echo "$filename - $link" >> failed_downloads.txt
+            fi
+            
+            # Small delay between downloads
+            sleep 2
+          done < links.txt
+          
+          # Create summary
+          echo ""
+          echo "======================"
+          echo "Download Summary:"
+          echo "  Successful: $successful"
+          echo "  Failed: $failed"
+          echo "  Total: $total_links"
+          
+          # Create manifest
+          echo "# AMASS Dataset Download" > MANIFEST.md
+          echo "" >> MANIFEST.md
+          echo "## Download Information" >> MANIFEST.md
+          echo "- **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
+          echo "- **Source:** $DOWNLOAD_URL" >> MANIFEST.md
+          echo "- **Exclude Renders:** $EXCLUDE_RENDERS" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          echo "## Downloaded Files" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          
+          # List all downloaded files
+          for file in *.tar.bz2 *.zip *.bz2; do
+            if [ -f "$file" ] && [ ! "$file" = "*.tar.bz2" ] && [ ! "$file" = "*.zip" ] && [ ! "$file" = "*.bz2" ]; then
+              size=$(du -h "$file" | cut -f1)
+              echo "- **$file** ($size)" >> MANIFEST.md
+              if [ -f "${file}.md5" ]; then
+                echo "  - MD5: $(cat "${file}.md5" | cut -d' ' -f1)" >> MANIFEST.md
+              fi
+            fi
+          done
+          
+          if [ -f failed_downloads.txt ] && [ -s failed_downloads.txt ]; then
+            echo "" >> MANIFEST.md
+            echo "## Failed Downloads" >> MANIFEST.md
+            echo '```' >> MANIFEST.md
+            cat failed_downloads.txt >> MANIFEST.md
+            echo '```' >> MANIFEST.md
+          fi
+          
+          echo "" >> MANIFEST.md
+          echo "## Usage" >> MANIFEST.md
+          echo '```bash' >> MANIFEST.md
+          echo "# Extract tar.bz2 files" >> MANIFEST.md
+          echo "tar -xjf filename.tar.bz2" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          echo "# Extract zip files" >> MANIFEST.md
+          echo "unzip filename.zip" >> MANIFEST.md
+          echo '```' >> MANIFEST.md
+          
+          # Cleanup
+          rm -f cookies.txt login_response.html download_page.html all_links.txt links.txt links_onclick.txt http_code.txt 2>/dev/null || true
+          
+          cd ..
+          
+          echo ""
+          echo "✓ Download process completed!"
+          echo "Files saved in: $DOWNLOAD_DIR"
+          
+          if [ $failed -gt 0 ]; then
+            echo "⚠ $failed files failed to download"
+            exit 1
+          fi
+      
+      - name: Push files to repository
+        if: github.event.inputs.push_to_repo == 'true' && success()
+        shell: bash
+        run: |
+          DOWNLOAD_DIR=$(ls -d amass_datasets_* 2>/dev/null | head -1)
+          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
+            echo "No download directory found"
+            exit 1
+          fi
+          
+          echo "Download directory: $DOWNLOAD_DIR"
+          
+          # Get the current branch
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          
+          # Add and commit files
+          git add "$DOWNLOAD_DIR"
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Download AMASS datasets [skip ci]"
+            git push origin "HEAD:$BRANCH"
+            echo "✓ Files pushed successfully!"
+          fi
