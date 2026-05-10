@@ -1,0 +1,232 @@
+name: GRAB Website Registration
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Email address for registration'
+        required: true
+        type: string
+        default: 'jamshid.bahrami@alumni.um.ac.ir'
+      password:
+        description: 'Password for registration (min 8 chars)'
+        required: true
+        type: string
+      base_url:
+        description: 'Base url'
+        required: true
+        type: string
+        default: 'https://amass.is.tue.mpg.de'
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Run registration with proper CSRF handling
+      id: registration
+      run: |
+        EMAIL="${{ github.event.inputs.email }}"
+        PASSWORD="${{ github.event.inputs.password }}"
+        BASE_URL="${{ github.event.inputs.base_url }}"
+        
+        echo "📝 Attempting registration for: $EMAIL"
+        echo "🌐 Using base URL: $BASE_URL"
+        
+        # Create a temporary directory for cookies and files
+        TEMP_DIR=$(mktemp -d)
+        COOKIE_FILE="$TEMP_DIR/cookies.txt"
+        
+        # Step 1: Get the registration page to extract CSRF token
+        echo "🔍 Fetching registration page to get CSRF token..."
+        INITIAL_RESPONSE=$(curl -s -L -c "$COOKIE_FILE" -b "$COOKIE_FILE" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+          "${BASE_URL}/register.php")
+        
+        # Extract CSRF token (the site might use different token names)
+        CSRF_TOKEN=$(echo "$INITIAL_RESPONSE" | grep -oP 'name="csrf_token" value="\K[^"]+' || echo "")
+        CSRF_TOKEN2=$(echo "$INITIAL_RESPONSE" | grep -oP 'name="_token" value="\K[^"]+' || echo "")
+        CSRF_TOKEN3=$(echo "$INITIAL_RESPONSE" | grep -oP 'name="authenticity_token" value="\K[^"]+' || echo "")
+        
+        # Save the initial page for debugging
+        echo "$INITIAL_RESPONSE" > "$TEMP_DIR/initial_page.html"
+        
+        # Prepare POST data
+        POST_DATA="email=$EMAIL&password=$PASSWORD&password2=$PASSWORD&terms=1&license=1&receiveemail=1&register=Register"
+        
+        # Add CSRF token if found
+        if [ -n "$CSRF_TOKEN" ]; then
+          echo "✅ Found CSRF token: $CSRF_TOKEN"
+          POST_DATA="$POST_DATA&csrf_token=$CSRF_TOKEN"
+        elif [ -n "$CSRF_TOKEN2" ]; then
+          echo "✅ Found CSRF token: $CSRF_TOKEN2"
+          POST_DATA="$POST_DATA&_token=$CSRF_TOKEN2"
+        elif [ -n "$CSRF_TOKEN3" ]; then
+          echo "✅ Found CSRF token: $CSRF_TOKEN3"
+          POST_DATA="$POST_DATA&authenticity_token=$CSRF_TOKEN3"
+        else
+          echo "⚠️ No CSRF token found, proceeding anyway"
+        fi
+        
+        # Step 2: Submit the registration
+        echo "📤 Submitting registration form..."
+        RESPONSE=$(curl -s -L -X POST \
+          -c "$COOKIE_FILE" \
+          -b "$COOKIE_FILE" \
+          -d "$POST_DATA" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -H "Referer: ${BASE_URL}/register.php" \
+          "${BASE_URL}/register.php")
+        
+        # Save the response for debugging
+        echo "$RESPONSE" > "$TEMP_DIR/response.html"
+        
+        # Analyze response
+        echo "📊 Analyzing response..."
+        
+        # Check for various success/error indicators
+        if echo "$RESPONSE" | grep -qi "thank you\|registration successful\|account created\|verification email"; then
+          echo "✅ SUCCESS: Registration appears successful!"
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=Registration successful. Check your email for verification." >> $GITHUB_OUTPUT
+          
+        elif echo "$RESPONSE" | grep -qi "email already\|already registered\|already exists"; then
+          echo "⚠️ Email already registered"
+          echo "status=already_registered" >> $GITHUB_OUTPUT
+          echo "message=This email is already registered" >> $GITHUB_OUTPUT
+          
+        elif echo "$RESPONSE" | grep -qi "password.*confirm\|password mismatch"; then
+          echo "❌ Password mismatch error"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "message=Password confirmation failed" >> $GITHUB_OUTPUT
+          
+        elif echo "$RESPONSE" | grep -qi "terms\|license"; then
+          echo "❌ Terms or license not accepted"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "message=Must accept terms and license" >> $GITHUB_OUTPUT
+          
+        elif echo "$RESPONSE" | grep -qi "invalid email"; then
+          echo "❌ Invalid email format"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "message=Invalid email address" >> $GITHUB_OUTPUT
+          
+        elif [ $(echo "$RESPONSE" | wc -c) -lt 1000 ]; then
+          # Very small response might indicate error
+          echo "⚠️ WARNING: Unusually small response"
+          echo "status=uncertain" >> $GITHUB_OUTPUT
+          echo "message=Response was unusually small, may indicate error" >> $GITHUB_OUTPUT
+          
+        else
+          echo "❓ Unknown response status"
+          echo "status=unknown" >> $GITHUB_OUTPUT
+          echo "message=Could not determine registration status" >> $GITHUB_OUTPUT
+        fi
+        
+        # Save response as artifact
+        cp "$TEMP_DIR/response.html" ./registration_response.html
+        cp "$TEMP_DIR/initial_page.html" ./initial_page.html
+        
+        # Clean up
+        rm -rf "$TEMP_DIR"
+        
+      shell: bash
+    
+    - name: Extract response details
+      if: always()
+      run: |
+        echo "## Registration Results" > registration_summary.md
+        echo "" >> registration_summary.md
+        echo "| Field | Value |" >> registration_summary.md
+        echo "|-------|-------|" >> registration_summary.md
+        echo "| Status | ${{ steps.registration.outputs.status }} |" >> registration_summary.md
+        echo "| Email | ${{ github.event.inputs.email }} |" >> registration_summary.md
+        echo "| Timestamp | $(date) |" >> registration_summary.md
+        echo "| Message | ${{ steps.registration.outputs.message }} |" >> registration_summary.md
+        echo "" >> registration_summary.md
+        
+        # Try to extract meaningful info from response
+        if [ -f registration_response.html ]; then
+          echo "### Response Preview:" >> registration_summary.md
+          echo '```html' >> registration_summary.md
+          head -50 registration_response.html >> registration_summary.md
+          echo '```' >> registration_summary.md
+        fi
+        
+      shell: bash
+    
+    - name: Upload artifacts for debugging
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: registration-debug-files
+        path: |
+          registration_response.html
+          initial_page.html
+          registration_summary.md
+        retention-days: 30
+    
+    - name: Commit and push results to repo
+      if: always()
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        # Create results directory
+        mkdir -p registration-results
+        
+        # Create timestamp
+        TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+        
+        # Save registration info
+        cat > "registration-results/registration_${TIMESTAMP}.txt" << EOF
+        Registration Attempt: $(date)
+        Status: ${{ steps.registration.outputs.status }}
+        Email: ${{ github.event.inputs.email }}
+        Message: ${{ steps.registration.outputs.message }}
+        ========================================
+        EOF
+        
+        # Create or update master log
+        if [ ! -f registration-results/REGISTRATION_LOG.md ]; then
+          echo "| Timestamp | Status | Email | Message |" > registration-results/REGISTRATION_LOG.md
+          echo "|-----------|--------|-------|---------|" >> registration-results/REGISTRATION_LOG.md
+        fi
+        echo "| $(date) | ${{ steps.registration.outputs.status }} | ${{ github.event.inputs.email }} | ${{ steps.registration.outputs.message }} |" >> registration-results/REGISTRATION_LOG.md
+        
+        # Commit changes
+        git add registration-results/
+        git commit -m "Update registration results: ${{ steps.registration.outputs.status }} [skip ci]" || echo "No changes to commit"
+        git push || echo "Failed to push - may need to pull first"
+        
+      shell: bash
+    
+    - name: Create GitHub summary
+      if: always()
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        # 🚀 GRAB Registration Results
+        
+        ## Status: **${{ steps.registration.outputs.status }}**
+        
+        ### Details:
+        - **Email:** ${{ github.event.inputs.email }}
+        - **Time:** $(date)
+        - **Message:** ${{ steps.registration.outputs.message }}
+        
+        ### 📝 Notes:
+        ${{ steps.registration.outputs.status == 'success' && '- Check your email for verification link\n- You may need to verify before downloading' || '- Check the artifacts for detailed debug information' }}
+        
+        ### 📂 Artifacts:
+        Download the debug files above to see the complete response.
+        EOF
+    
+    - name: Send failure notification
+      if: steps.registration.outputs.status != 'success'
+      run: |
+        echo "::warning::Registration was not successful. Status: ${{ steps.registration.outputs.status }}"
+        echo "Check the uploaded artifacts for detailed response information."
+        exit 0
