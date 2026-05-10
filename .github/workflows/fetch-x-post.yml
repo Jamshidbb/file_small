@@ -1,0 +1,166 @@
+name: Fetch X Post
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: 'X/Twitter Post ID'
+        required: true
+        type: string
+        default: 'Jason_Jorjani'
+      output_filename:
+        description: 'Output markdown filename (without .md)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  fetch-x-post:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install requests
+      
+      - name: Fetch X Post
+        env:
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          POST_ID: ${{ github.event.inputs.post_id }}
+          OUTPUT_FILENAME: ${{ github.event.inputs.output_filename }}
+        run: |
+          python3 -c "
+          import os
+          import json
+          import requests
+          from datetime import datetime
+          import re
+          
+          bearer_token = os.environ.get('X_BEARER_TOKEN')
+          post_id = os.environ.get('POST_ID')
+          
+          if not bearer_token:
+              print('Error: X_BEARER_TOKEN not set in secrets')
+              exit(1)
+          
+          if not post_id:
+              print('Error: POST_ID not provided')
+              exit(1)
+          
+          # X API v2 endpoint
+          url = f'https://api.twitter.com/2/tweets/{post_id}'
+          
+          params = {
+              'tweet.fields': 'created_at,author_id,public_metrics,lang',
+              'expansions': 'author_id'
+          }
+          
+          headers = {'Authorization': f'Bearer {bearer_token}'}
+          
+          print(f'Fetching post {post_id}...')
+          response = requests.get(url, headers=headers, params=params)
+          
+          if response.status_code != 200:
+              print(f'Error: API returned {response.status_code}')
+              print(response.text)
+              exit(1)
+          
+          data = response.json()
+          
+          post = data.get('data', {})
+          includes = data.get('includes', {})
+          users = includes.get('users', [])
+          
+          author = users[0] if users else {'name': 'Unknown', 'username': 'unknown'}
+          
+          # Create frontmatter as JSON
+          frontmatter = {
+              'title': f'X Post from @{author.get(\"username\", \"unknown\")}',
+              'date': datetime.now().isoformat(),
+              'source_post_id': post_id,
+              'author_name': author.get('name', 'Unknown'),
+              'author_username': f'@{author.get(\"username\", \"unknown\")}',
+              'created_at': post.get('created_at', 'Unknown'),
+              'metrics': post.get('public_metrics', {})
+          }
+          
+          # Convert frontmatter to JSON string
+          frontmatter_json = json.dumps(frontmatter, indent=2)
+          
+          # Format the date for display
+          created_at = post.get('created_at', 'Unknown date')
+          try:
+              date_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+              formatted_date = date_obj.strftime('%B %d, %Y at %I:%M %p UTC')
+          except:
+              formatted_date = created_at
+          
+          # Get post text
+          post_text = post.get('text', 'No content available')
+          if post_text is None:
+              post_text = 'No content available'
+          
+          # Create markdown with JSON frontmatter
+          markdown_content = '---\n' + frontmatter_json + '\n---\n\n'
+          markdown_content += f'# X Post from @{author.get(\"username\", \"unknown\")}\n\n'
+          markdown_content += f'**Author:** {author.get(\"name\", \"Unknown\")} (@{author.get(\"username\", \"unknown\")})\n'
+          markdown_content += f'**Posted:** {formatted_date}\n'
+          markdown_content += f'**Post ID:** {post_id}\n\n'
+          markdown_content += '## Content\n\n'
+          markdown_content += f'{post_text}\n\n'
+          markdown_content += '## Metrics\n\n'
+          markdown_content += f'- 🔄 Retweets: {post.get(\"public_metrics\", {}).get(\"retweet_count\", 0)}\n'
+          markdown_content += f'- ❤️ Likes: {post.get(\"public_metrics\", {}).get(\"like_count\", 0)}\n'
+          markdown_content += f'- 💬 Replies: {post.get(\"public_metrics\", {}).get(\"reply_count\", 0)}\n'
+          markdown_content += f'- 📊 Quotes: {post.get(\"public_metrics\", {}).get(\"quote_count\", 0)}\n\n'
+          markdown_content += '---\n\n'
+          markdown_content += f'🔗 [View original post on X](https://twitter.com/i/web/status/{post_id})\n'
+          
+          # Create directory and save file
+          os.makedirs('x-posts', exist_ok=True)
+          
+          # Use post_id as filename if no custom name provided
+          output_filename = os.environ.get('OUTPUT_FILENAME', '')
+          if not output_filename:
+              output_filename = f'post_{post_id}'
+          
+          if not output_filename.endswith('.md'):
+              output_filename += '.md'
+          
+          # Sanitize filename
+          output_filename = re.sub(r'[<>:\"/\\\\|?*]', '_', output_filename)
+          output_path = os.path.join('x-posts', output_filename)
+          
+          with open(output_path, 'w', encoding='utf-8') as f:
+              f.write(markdown_content)
+          
+          print(f'✅ Successfully saved to {output_path}')
+          print(f'📊 Post metrics: {post.get(\"public_metrics\", {})}')
+          "
+      
+      - name: Commit and push markdown file
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if [ -d "x-posts" ] && [ -n "$(ls -A x-posts/*.md 2>/dev/null)" ]; then
+            git add x-posts/*.md
+            git commit -m "Add X post from ID: ${{ github.event.inputs.post_id }} [skip ci]" || echo "No changes to commit"
+            git push
+            echo "✅ Successfully pushed to repository"
+          else
+            echo "No markdown files found to commit"
+            exit 1
+          fi
