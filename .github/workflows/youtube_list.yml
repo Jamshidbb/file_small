@@ -1,0 +1,346 @@
+name: Parse YouTube Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL'
+        required: true
+        default: ''
+        type: string
+
+jobs:
+  parse-and-list:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      # Cache apt packages
+      - name: Cache apt packages
+        uses: actions/cache@v3
+        id: apt-cache
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+      
+      # Cache jq binary
+      - name: Cache jq binary
+        uses: actions/cache@v3
+        id: jq-cache
+        with:
+          path: /usr/local/bin/jq
+          key: ${{ runner.os }}-jq-1.6
+          restore-keys: |
+            ${{ runner.os }}-jq-
+      
+      - name: Install jq (if not cached)
+        run: |
+          if command -v jq &> /dev/null; then
+            echo "✅ jq already installed: $(jq --version)"
+          else
+            echo "Installing jq..."
+            sudo apt-get update
+            sudo apt-get install -y jq
+            sudo cp $(which jq) /usr/local/bin/ 2>/dev/null || true
+          fi
+      
+      - name: Create version file
+        run: |
+          echo "jq $(jq --version)" > apt-packages.txt
+      
+      # Generate URL hash first for cache key
+      - name: Generate URL hash
+        id: url-hash
+        run: |
+          echo -n "${{ inputs.url }}" | sha256sum | cut -d' ' -f1 > url-hash.txt
+          echo "URL_HASH=$(cat url-hash.txt)" >> $GITHUB_ENV
+      
+      # Cache API response
+      - name: Cache API response
+        uses: actions/cache@v3
+        id: api-cache
+        with:
+          path: response.json
+          key: ${{ runner.os }}-yt-${{ env.URL_HASH }}
+          restore-keys: |
+            ${{ runner.os }}-yt-
+      
+      - name: Fetch video data
+        run: |
+          if [ "${{ steps.api-cache.outputs.cache-hit }}" == "true" ] && [ -f response.json ] && [ -s response.json ]; then
+            echo "✅ Using cached API response for URL: ${{ inputs.url }}"
+            # Validate cached file
+            if ! jq empty response.json 2>/dev/null; then
+              echo "⚠️ Cached file invalid, refetching..."
+              rm -f response.json
+              CACHE_HIT=false
+            else
+              CACHE_HIT=true
+            fi
+          else
+            CACHE_HIT=false
+          fi
+          
+          if [ "$CACHE_HIT" != "true" ]; then
+            echo "Fetching fresh data from API..."
+            curl -X POST "https://app.ytdown.to/proxy.php" \
+              -H "accept: */*" \
+              -H "content-type: application/x-www-form-urlencoded; charset=UTF-8" \
+              --data-urlencode "url=${{ inputs.url }}" \
+              --max-time 60 \
+              -o response.json \
+              -s \
+              --write-out "\n✅ Data fetched (HTTP %{http_code}, Time: %{time_total}s)\n"
+            
+            # Validate response
+            if ! jq empty response.json 2>/dev/null; then
+              echo "❌ Invalid JSON response"
+              cat response.json
+              exit 1
+            fi
+            
+            # Check if API returned error
+            if [ "$(jq -r '.api // .error // ""' response.json)" == "null" ]; then
+              echo "❌ API returned error response"
+              cat response.json
+              exit 1
+            fi
+            
+            echo "✅ Data fetched and validated"
+          fi
+      
+      - name: Create markdown report with all links
+        run: |
+          # Extract video info
+          TITLE=$(jq -r '.api.title // "Unknown Title"' response.json)
+          CHANNEL=$(jq -r '.api.userInfo.name // "Unknown Channel"' response.json)
+          VIDEO_ID=$(jq -r '.api.id // "unknown"' response.json)
+          DURATION=$(jq -r '.api.mediaDuration // "Unknown"' response.json)
+          VIEWS=$(jq -r '.api.mediaStats.viewsCount // "0"' response.json)
+          GENERATED=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          # Create markdown file using printf
+          printf '# 📹 YouTube Video Download Links\n\n' > VIDEO_DOWNLOAD_LINKS.md
+          printf '## Video Information\n\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| Field | Value |\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '|-------|-------|\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Title** | %s |\n' "$TITLE" >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Channel** | %s |\n' "$CHANNEL" >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Video ID** | %s |\n' "$VIDEO_ID" >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Duration** | %s |\n' "$DURATION" >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Views** | %s |\n' "$VIEWS" >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| **Generated** | %s |\n' "$GENERATED" >> VIDEO_DOWNLOAD_LINKS.md
+          
+          printf '\n---\n\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '## Download Links\n\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '| # | Type | Quality | Resolution | Size | Extension |\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '|---|------|---------|------------|------|-----------|\n' >> VIDEO_DOWNLOAD_LINKS.md
+          
+          # Add table rows
+          if jq -e '.api.mediaItems | length > 0' response.json > /dev/null 2>&1; then
+            jq -r '.api.mediaItems | to_entries[] | 
+              "| \(.key + 1) | \(.value.type) | \(.value.mediaQuality) | \(.value.mediaRes // "Audio Only") | \(.value.mediaFileSize) | \(.value.mediaExtension) |"' response.json >> VIDEO_DOWNLOAD_LINKS.md
+          else
+            printf '| - | No formats found | - | - | - | - |\n' >> VIDEO_DOWNLOAD_LINKS.md
+          fi
+          
+          printf '\n---\n\n' >> VIDEO_DOWNLOAD_LINKS.md
+          printf '## Direct Download URLs\n\n' >> VIDEO_DOWNLOAD_LINKS.md
+          
+          # Add each format with its direct link
+          if jq -e '.api.mediaItems | length > 0' response.json > /dev/null 2>&1; then
+            jq -r '.api.mediaItems | to_entries[] | 
+              "### Format #\(.key + 1): \(.value.type) - \(.value.mediaQuality)\n\n" +
+              "**Resolution:** \(.value.mediaRes // "Audio Only")\n\n" +
+              "**Size:** \(.value.mediaFileSize)\n\n" +
+              "**Extension:** \(.value.mediaExtension)\n\n" +
+              "**Direct Download Link:**\n" +
+              "```\n\(.value.mediaUrl)\n```\n\n" +
+              "---\n"' response.json >> VIDEO_DOWNLOAD_LINKS.md
+          else
+            printf 'No video formats available for this URL.\n' >> VIDEO_DOWNLOAD_LINKS.md
+          fi
+          
+          echo "✅ Markdown report created: VIDEO_DOWNLOAD_LINKS.md"
+          
+          # Show summary in logs
+          echo ""
+          echo "========================================="
+          echo "📊 VIDEO INFORMATION:"
+          echo "========================================="
+          echo "Title: $TITLE"
+          echo "Channel: $CHANNEL"
+          echo "Duration: $DURATION seconds"
+          echo "Views: $VIEWS"
+          echo ""
+          echo "AVAILABLE FORMATS:"
+          echo "========================================="
+          jq -r '.api.mediaItems | to_entries[] | "  #\(.key + 1): \(.value.type) - \(.value.mediaQuality) - \(.value.mediaFileSize)"' response.json 2>/dev/null || echo "  No formats found"
+          echo "========================================="
+      
+      - name: Prepare files in temp directory
+        id: prepare-files
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          mkdir -p /tmp/video_data
+          
+          # Copy files to temp location
+          cp VIDEO_DOWNLOAD_LINKS.md /tmp/VIDEO_DOWNLOAD_LINKS.md
+          cp response.json /tmp/response.json
+          
+          # Create video_data structure in temp
+          cp VIDEO_DOWNLOAD_LINKS.md "/tmp/video_data/links_${TIMESTAMP}.md"
+          cp VIDEO_DOWNLOAD_LINKS.md "/tmp/video_data/LATEST_LINKS.md"
+          cp response.json "/tmp/video_data/data_${TIMESTAMP}.json"
+          
+          # Create text version with URLs
+          echo "# Direct Download URLs" > "/tmp/video_data/urls_${TIMESTAMP}.txt"
+          echo "# Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "/tmp/video_data/urls_${TIMESTAMP}.txt"
+          echo "# URL: ${{ inputs.url }}" >> "/tmp/video_data/urls_${TIMESTAMP}.txt"
+          echo "" >> "/tmp/video_data/urls_${TIMESTAMP}.txt"
+          
+          jq -r '.api.mediaItems[] | "\(.type) - \(.mediaQuality):\n\(.mediaUrl)\n"' response.json >> "/tmp/video_data/urls_${TIMESTAMP}.txt" 2>/dev/null
+          
+          cp "/tmp/video_data/urls_${TIMESTAMP}.txt" "/tmp/video_data/LATEST_URLS.txt"
+          
+          # Create README if it doesn't exist (check in temp first, we'll create if needed)
+          cat > "/tmp/video_data/README.md" << 'EOF'
+          # Video Data Archive
+          
+          This directory contains parsed YouTube video information and download links.
+          
+          ## Latest Files
+          - [LATEST_LINKS.md](LATEST_LINKS.md) - Latest video links (Markdown)
+          - [LATEST_URLS.txt](LATEST_URLS.txt) - Latest direct URLs (Plain text)
+          
+          ## Archived Files
+          All historical data is saved with timestamps.
+          
+          ## Format
+          - `links_YYYYMMDD_HHMMSS.md` - Markdown with all information
+          - `urls_YYYYMMDD_HHMMSS.txt` - Plain text URLs only
+          - `data_YYYYMMDD_HHMMSS.json` - Raw API response
+          EOF
+          
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+          echo "✅ Files prepared in /tmp/video_data"
+      
+      # Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+      
+      - name: Commit and push to repository
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Pull latest changes
+          git pull origin ${{ github.ref_name }} --no-rebase --autostash || echo "No changes to pull"
+          
+          # Create video_data directory if it doesn't exist
+          mkdir -p video_data
+          
+          # Copy files from temp to repo
+          cp /tmp/video_data/* video_data/
+          cp /tmp/VIDEO_DOWNLOAD_LINKS.md .
+          cp /tmp/response.json .
+          
+          # Add files
+          git add video_data/
+          git add VIDEO_DOWNLOAD_LINKS.md
+          git add response.json
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No new changes to commit"
+          else
+            echo "Committing changes..."
+            git commit -m "Add video download links for $(date -u +"%Y-%m-%d") [skip ci]"
+            
+            # Push with retry
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            PUSH_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$PUSH_SUCCESS" = false ]; do
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "Push attempt $RETRY_COUNT of $MAX_RETRIES..."
+              
+              if git push origin HEAD:${{ github.ref_name }}; then
+                PUSH_SUCCESS=true
+                echo "✅ Push successful!"
+              else
+                echo "⚠️ Push failed, pulling latest changes..."
+                git pull origin ${{ github.ref_name }} --rebase --autostash
+              fi
+            done
+            
+            if [ "$PUSH_SUCCESS" = false ]; then
+              echo "❌ Failed to push after $MAX_RETRIES attempts"
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Saved to repository:"
+          echo "   - video_data/LATEST_LINKS.md"
+          echo "   - video_data/LATEST_URLS.txt"
+          echo "   - video_data/links_${TIMESTAMP}.md"
+          echo "   - video_data/urls_${TIMESTAMP}.txt"
+          echo "   - video_data/data_${TIMESTAMP}.json"
+          echo "   - VIDEO_DOWNLOAD_LINKS.md"
+          echo "   - response.json"
+      
+      - name: Create workflow summary
+        if: always()
+        run: |
+          TITLE=$(jq -r '.api.title // "Unknown Title"' /tmp/response.json 2>/dev/null || jq -r '.api.title // "Unknown Title"' response.json)
+          CHANNEL=$(jq -r '.api.userInfo.name // "Unknown Channel"' /tmp/response.json 2>/dev/null || jq -r '.api.userInfo.name // "Unknown Channel"' response.json)
+          FORMAT_COUNT=$(jq '.api.mediaItems | length' /tmp/response.json 2>/dev/null || jq '.api.mediaItems | length' response.json 2>/dev/null || echo "0")
+          
+          echo "## ✅ YouTube Video Parsed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Video** | $TITLE |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Channel** | $CHANNEL |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Formats Available** | $FORMAT_COUNT |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📁 Files Saved" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [LATEST_LINKS.md](https://github.com/${{ github.repository }}/blob/main/video_data/LATEST_LINKS.md) - Complete markdown report" >> $GITHUB_STEP_SUMMARY
+          echo "- [LATEST_URLS.txt](https://github.com/${{ github.repository }}/blob/main/video_data/LATEST_URLS.txt) - Plain text URLs only" >> $GITHUB_STEP_SUMMARY
+          echo "- [Raw JSON Data](https://github.com/${{ github.repository }}/blob/main/video_data/data_${{ env.TIMESTAMP }}.json) - API response" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Quick Stats" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add format breakdown
+          echo "<details><summary>Click to see all formats</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| # | Type | Quality | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|------|---------|------|" >> $GITHUB_STEP_SUMMARY
+          
+          jq -r '.api.mediaItems | to_entries[] | 
+            "| \(.key + 1) | \(.value.type) | \(.value.mediaQuality) | \(.value.mediaFileSize) |"' /tmp/response.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || \
+          jq -r '.api.mediaItems | to_entries[] | 
+            "| \(.key + 1) | \(.value.type) | \(.value.mediaQuality) | \(.value.mediaFileSize) |"' response.json 2>/dev/null >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload artifact (optional - for quick access)
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-download-links
+          path: |
+            VIDEO_DOWNLOAD_LINKS.md
+            response.json
+          retention-days: 7
+          if-no-files-found: ignore
