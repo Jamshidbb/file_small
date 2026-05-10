@@ -1,0 +1,148 @@
+name: Fetch Remote File
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the file to download'
+        required: true
+        type: string
+        default: ''
+      filename:
+        description: 'Name to save the file as'
+        required: false
+        type: string
+        default: 'r.html'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      - name: Download file from URL
+        run: |
+          DOWNLOAD_DIR="download_$(date +%Y%m%d_%H%M%S)"
+          mkdir -p "$DOWNLOAD_DIR"
+          echo "DOWNLOAD_DIR=$DOWNLOAD_DIR" >> $GITHUB_ENV
+          
+          curl -L --progress-bar -o "$DOWNLOAD_DIR/${{ github.event.inputs.filename }}" "${{ github.event.inputs.url }}"
+          
+          cd "$DOWNLOAD_DIR"
+          FILE_SIZE=$(stat -c%s "${{ github.event.inputs.filename }}")
+          echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+          echo "File size: $FILE_SIZE bytes ($((FILE_SIZE / 1024 / 1024)) MB)"
+          cd ..
+          
+      - name: Split large file if needed
+        run: |
+          THRESHOLD=$((100 * 1024 * 1024))
+          
+          if [ $FILE_SIZE -gt $THRESHOLD ]; then
+            echo "File exceeds 100MB. Splitting into 95MB chunks..."
+            
+            cd "$DOWNLOAD_DIR"
+            BASENAME=$(basename "${{ github.event.inputs.filename }}")
+            
+            split -b 95M -d "${{ github.event.inputs.filename }}" "${BASENAME}.part"
+            rm "${{ github.event.inputs.filename }}"
+            
+            echo "ORIGINAL_FILENAME=${{ github.event.inputs.filename }}" > MANIFEST.txt
+            echo "ORIGINAL_SIZE=$FILE_SIZE" >> MANIFEST.txt
+            echo "ORIGINAL_URL=${{ github.event.inputs.url }}" >> MANIFEST.txt
+            echo "SPLIT_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.txt
+            echo "PART_COUNT=$(ls ${BASENAME}.part* 2>/dev/null | wc -l)" >> MANIFEST.txt
+            
+            # Create reassembly script - using printf instead of heredoc to avoid YAML issues
+            printf '#!/bin/bash\n' > reassemble.sh
+            printf 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n' >> reassemble.sh
+            printf 'cd "$SCRIPT_DIR"\n' >> reassemble.sh
+            printf '\n' >> reassemble.sh
+            printf 'if [ ! -f "MANIFEST.txt" ]; then\n' >> reassemble.sh
+            printf '  echo "ERROR: MANIFEST.txt not found"\n' >> reassemble.sh
+            printf '  exit 1\n' >> reassemble.sh
+            printf 'fi\n' >> reassemble.sh
+            printf '\n' >> reassemble.sh
+            printf 'source MANIFEST.txt\n' >> reassemble.sh
+            printf 'echo "Reassembling $ORIGINAL_FILENAME..."\n' >> reassemble.sh
+            printf 'cat ${ORIGINAL_FILENAME}.part* > "$ORIGINAL_FILENAME"\n' >> reassemble.sh
+            printf '\n' >> reassemble.sh
+            printf 'REASSEMBLED_SIZE=$(stat -c%s "$ORIGINAL_FILENAME")\n' >> reassemble.sh
+            printf 'if [ "$REASSEMBLED_SIZE" -eq "$ORIGINAL_SIZE" ]; then\n' >> reassemble.sh
+            printf '  echo "✓ Success! File: $ORIGINAL_FILENAME"\n' >> reassemble.sh
+            printf '  echo "To cleanup: rm ${ORIGINAL_FILENAME}.part* MANIFEST.txt reassemble.sh"\n' >> reassemble.sh
+            printf 'else\n' >> reassemble.sh
+            printf '  echo "✗ Size mismatch!"\n' >> reassemble.sh
+            printf '  exit 1\n' >> reassemble.sh
+            printf 'fi\n' >> reassemble.sh
+            
+            chmod +x reassemble.sh
+            
+            # Create README using printf as well
+            printf "# Download: ${{ github.event.inputs.filename }}\n\n" > README.md
+            printf "**Original URL:** ${{ github.event.inputs.url }}\n" >> README.md
+            printf "**Original Size:** $FILE_SIZE bytes ($((FILE_SIZE / 1024 / 1024)) MB)\n" >> README.md
+            printf "**Split Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')\n\n" >> README.md
+            printf "## Reassembly Instructions\n\n" >> README.md
+            printf "To reassemble the original file, run:\n\n" >> README.md
+            printf '\`\`\`bash\n' >> README.md
+            printf "./reassemble.sh\n" >> README.md
+            printf '\`\`\`\n' >> README.md
+            
+            cd ..
+            echo "FILE_SPLIT=true" >> $GITHUB_ENV
+          else
+            echo "FILE_SPLIT=false" >> $GITHUB_ENV
+            
+            cd "$DOWNLOAD_DIR"
+            printf "# Download: ${{ github.event.inputs.filename }}\n\n" > README.md
+            printf "**Original URL:** ${{ github.event.inputs.url }}\n" >> README.md
+            printf "**File Size:** $FILE_SIZE bytes ($((FILE_SIZE / 1024 / 1024)) MB)\n" >> README.md
+            printf "**Download Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')\n\n" >> README.md
+            printf "This file was downloaded directly without splitting.\n" >> README.md
+            cd ..
+          fi
+          
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add "$DOWNLOAD_DIR/"
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          COMMIT_MSG="Add ${{ github.event.inputs.filename }} from ${{ github.event.inputs.url }}"
+          git commit -m "$COMMIT_MSG"
+          git push origin HEAD:${GITHUB_REF#refs/heads/} --force-with-lease
+          
+          echo "✓ Successfully pushed all files"
+          
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "✅ FETCH COMPLETE"
+          echo "=========================================="
+          echo "URL: ${{ github.event.inputs.url }}"
+          echo "File: ${{ github.event.inputs.filename }}"
+          echo "Size: $FILE_SIZE bytes ($((FILE_SIZE / 1024 / 1024)) MB)"
+          echo "Location: $DOWNLOAD_DIR/"
+          
+          if [ "$FILE_SPLIT" = "true" ]; then
+            echo "Status: Split into chunks (use reassemble.sh to join)"
+            echo ""
+            echo "To reassemble:"
+            echo "  cd $DOWNLOAD_DIR && ./reassemble.sh"
+          else
+            echo "Status: Stored directly"
+            echo "  File: $DOWNLOAD_DIR/${{ github.event.inputs.filename }}"
+          fi
+          echo "=========================================="
