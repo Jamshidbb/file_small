@@ -1,0 +1,176 @@
+name: Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Website URL to mirror'
+        required: true
+        type: string
+      depth:
+        description: 'Mirror depth (0=infinite, 1-10 for limited)'
+        required: false
+        default: '3'
+        type: string
+      max_rate:
+        description: 'Max download rate (KB/s, 0=unlimited)'
+        required: false
+        default: '0'
+        type: string
+      exclude_patterns:
+        description: 'Patterns to exclude (comma-separated, e.g., *.pdf, *.zip)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mirror-advanced:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Install HTTrack
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y httrack
+    
+    - name: Build exclude patterns
+      id: exclude
+      run: |
+        if [ -n "${{ github.event.inputs.exclude_patterns }}" ]; then
+          EXCLUDE=""
+          IFS=',' read -ra PATTERNS <<< "${{ github.event.inputs.exclude_patterns }}"
+          for pattern in "${PATTERNS[@]}"; do
+            pattern=$(echo "$pattern" | xargs)
+            EXCLUDE="$EXCLUDE -\"*$pattern*\""
+          done
+          echo "exclude_opts=$EXCLUDE" >> $GITHUB_OUTPUT
+        else
+          echo "exclude_opts=" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Mirror website with HTTrack
+      run: |
+        mkdir -p website-mirror
+        cd website-mirror
+        
+        # Valid HTTrack options only
+        CMD="httrack \"${{ github.event.inputs.url }}\" \
+          -O ./mirror \
+          -%v \
+          --depth=${{ github.event.inputs.depth }} \
+          --max-rate=${{ github.event.inputs.max_rate }} \
+          --mirror \
+          --robots=0 \
+          --stay-on-same-domain \
+          --can-go-up-and-down \
+          --cache=1 \
+          --retries=3 \
+          --timeout=30"
+        
+        # Add exclude patterns if provided
+        if [ -n "${{ steps.exclude.outputs.exclude_opts }}" ]; then
+          CMD="$CMD ${{ steps.exclude.outputs.exclude_opts }}"
+        fi
+        
+        echo "Running: $CMD"
+        eval $CMD 2>&1 | tee httrack_output.log
+        
+        echo "HTTrack execution completed with exit code: $?"
+    
+    - name: Process downloaded files
+      run: |
+        cd website-mirror
+        
+        echo "Files in mirror directory:"
+        ls -la mirror/ 2>/dev/null || echo "No mirror directory found"
+        
+        if [ -d "mirror" ] && [ "$(ls -A mirror 2>/dev/null)" ]; then
+          echo "Content successfully downloaded to mirror/"
+          if [ -f "mirror/index.html" ] && [ ! -f "index.html" ]; then
+            cp mirror/index.html ./index.html 2>/dev/null || true
+          fi
+        else
+          echo "Warning: No content was downloaded"
+        fi
+        
+        echo "Mirror Information" > MIRROR_INFO.txt
+        echo "==================" >> MIRROR_INFO.txt
+        echo "Mirror created on: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> MIRROR_INFO.txt
+        echo "Source URL: ${{ github.event.inputs.url }}" >> MIRROR_INFO.txt
+        echo "Depth: ${{ github.event.inputs.depth }}" >> MIRROR_INFO.txt
+        echo "Max Rate: ${{ github.event.inputs.max_rate }} KB/s" >> MIRROR_INFO.txt
+        echo "" >> MIRROR_INFO.txt
+        echo "Downloaded files:" >> MIRROR_INFO.txt
+        find . -type f -not -name "*.log" -not -name "MIRROR_INFO.txt" | head -20 >> MIRROR_INFO.txt
+    
+    - name: Zip the mirrored files
+      run: |
+        cd website-mirror
+        
+        # Create a zip filename with timestamp
+        TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+        DOMAIN=$(echo "${{ github.event.inputs.url }}" | sed 's|https\?://||' | sed 's|/.*||')
+        ZIP_NAME="${DOMAIN}_mirror_${TIMESTAMP}.zip"
+        
+        echo "Creating zip file: $ZIP_NAME"
+        
+        # Zip all mirrored files (excluding the output log and info file from zip)
+        zip -r "$ZIP_NAME" . -x "httrack_output.log" "MIRROR_INFO.txt"
+        
+        # Move zip to parent directory for easier access
+        mv "$ZIP_NAME" ../
+        
+        echo "ZIP_FILE=$ZIP_NAME" >> $GITHUB_ENV
+        echo "Zip file created successfully"
+        
+        # Show zip file size
+        ls -lh "../$ZIP_NAME"
+    
+    - name: Create mirror info with zip location
+      run: |
+        cd website-mirror
+        
+        echo "" >> MIRROR_INFO.txt
+        echo "Zip Archive:" >> MIRROR_INFO.txt
+        echo "Filename: ${{ env.ZIP_FILE }}" >> MIRROR_INFO.txt
+        echo "Size: $(du -h "../${{ env.ZIP_FILE }}" | cut -f1)" >> MIRROR_INFO.txt
+    
+    - name: Commit and push zip file and info
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Add the zip file and the mirrored files
+        git add website-mirror/
+        git add "${{ env.ZIP_FILE }}" 2>/dev/null || true
+        
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Mirror website: ${{ github.event.inputs.url }}
+          
+          Mirror Details:
+          - Depth: ${{ github.event.inputs.depth }}
+          - Speed Limit: ${{ github.event.inputs.max_rate }} KB/s
+          - Zip Archive: ${{ env.ZIP_FILE }}
+          
+          Generated by GitHub Actions"
+          
+          git push
+        fi
+    
+    - name: Upload zip as artifact (optional)
+      uses: actions/upload-artifact@v4
+      with:
+        name: website-mirror-zip
+        path: ${{ env.ZIP_FILE }}
+        retention-days: 90
