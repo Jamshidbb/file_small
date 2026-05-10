@@ -1,0 +1,227 @@
+name: MPG Dataset Single File Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'MPG Username (email)'
+        required: true
+        type: string
+        default: 'jamshid.bahrami@alumni.um.ac.ir'
+      password:
+        description: 'MPG Password'
+        required: true
+        type: string
+      download_url:
+        description: 'Full download URL (e.g., https://amass.is.tue.mpg.de/download.php)'
+        required: true
+        type: string
+      output_filename:
+        description: 'Output filename (optional, will auto-detect if empty)'
+        required: false
+        type: string
+        default: ''
+      allow_html:
+        description: 'Allow downloading HTML pages (true/false)'
+        required: false
+        type: boolean
+        default: false
+      push_to_repo:
+        description: 'Push file to repository?'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  download-single-file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Login and download file
+        env:
+          USERNAME: ${{ github.event.inputs.username }}
+          PASSWORD: ${{ github.event.inputs.password }}
+          DOWNLOAD_URL: ${{ github.event.inputs.download_url }}
+          OUTPUT_NAME: ${{ github.event.inputs.output_filename }}
+          ALLOW_HTML: ${{ github.event.inputs.allow_html }}
+        shell: bash
+        run: |
+          # Extract base URL from download URL
+          BASE_URL=$(echo "$DOWNLOAD_URL" | grep -oE 'https?://[^/]+')
+          
+          echo "Base URL: $BASE_URL"
+          echo "Download URL: $DOWNLOAD_URL"
+          echo "Allow HTML: $ALLOW_HTML"
+          
+          # Create download directory
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          DOWNLOAD_DIR="mpg_download_${TIMESTAMP}"
+          mkdir -p "$DOWNLOAD_DIR"
+          cd "$DOWNLOAD_DIR"
+          
+          # Construct login URL
+          LOGIN_URL="${BASE_URL}/login.php"
+          
+          # Login and save session
+          echo "Logging in to ${BASE_URL}..."
+          curl -L -c cookies.txt -b cookies.txt \
+            -d "username=$USERNAME" \
+            -d "password=$PASSWORD" \
+            -d "commit=Log in" \
+            "$LOGIN_URL" -o login_response.html
+          
+          # Verify login (look for common success indicators)
+          if grep -q -i "logout\|dashboard\|account\|welcome" login_response.html; then
+            echo "✓ Login successful"
+          else
+            echo "✗ Login failed"
+            echo "Response preview:"
+            head -20 login_response.html
+            exit 1
+          fi
+          
+          # Download the requested file/page
+          echo "Downloading from: $DOWNLOAD_URL"
+          
+          # Determine output filename
+          if [ -z "$OUTPUT_NAME" ]; then
+            OUTPUT_NAME=$(basename "$DOWNLOAD_URL" | sed 's/?.*//')
+            if [ -z "$OUTPUT_NAME" ] || [ "$OUTPUT_NAME" = "download.php" ]; then
+              OUTPUT_NAME="download_page.html"
+            fi
+          fi
+          
+          echo "Output file: $OUTPUT_NAME"
+          
+          # Download with session cookies
+          curl -L -b cookies.txt -c cookies.txt \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Referer: ${BASE_URL}/" \
+            -o "$OUTPUT_NAME" \
+            -w "HTTP Status: %{http_code}\n" \
+            "$DOWNLOAD_URL"
+          
+          # Check if download was successful
+          if [ -f "$OUTPUT_NAME" ] && [ -s "$OUTPUT_NAME" ]; then
+            size=$(du -h "$OUTPUT_NAME" | cut -f1)
+            lines=$(wc -l < "$OUTPUT_NAME")
+            file_type=$(file "$OUTPUT_NAME")
+            
+            echo "✓ Successfully downloaded: $OUTPUT_NAME"
+            echo "  Size: $size"
+            echo "  Lines: $lines"
+            echo "  Type: $file_type"
+            
+            # Check if it's HTML and we didn't allow it
+            if echo "$file_type" | grep -q "HTML document"; then
+              if [ "$ALLOW_HTML" = "false" ]; then
+                echo "⚠ Warning: Downloaded HTML page instead of binary file"
+                echo "  If you want to download HTML pages, set 'allow_html' to true"
+              else
+                echo "✓ HTML page download allowed"
+              fi
+              
+              # Show preview
+              echo ""
+              echo "Page preview (first 10 lines):"
+              echo "----------------------------------------"
+              head -10 "$OUTPUT_NAME"
+              echo "----------------------------------------"
+            fi
+            
+            # Create manifest
+            echo "# MPG Dataset Download" > MANIFEST.md
+            echo "" >> MANIFEST.md
+            echo "**Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
+            echo "**Base URL:** $BASE_URL" >> MANIFEST.md
+            echo "**Download URL:** $DOWNLOAD_URL" >> MANIFEST.md
+            echo "**Allow HTML:** $ALLOW_HTML" >> MANIFEST.md
+            echo "" >> MANIFEST.md
+            echo "## Downloaded files:" >> MANIFEST.md
+            echo "" >> MANIFEST.md
+            echo "- **$OUTPUT_NAME**" >> MANIFEST.md
+            echo "  - Size: $size" >> MANIFEST.md
+            echo "  - Lines: $lines" >> MANIFEST.md
+            echo "  - Type: $(file "$OUTPUT_NAME" | cut -d: -f2)" >> MANIFEST.md
+            echo "" >> MANIFEST.md
+            
+            # Extract and list download links if it's an HTML page
+            if echo "$file_type" | grep -q "HTML document"; then
+              echo "## Available download links found in page:" >> MANIFEST.md
+              echo "" >> MANIFEST.md
+              # Extract links safely
+              grep -E 'href="[^"]*\.(zip|tar|gz|tgz)[^"]*"' "$OUTPUT_NAME" | \
+                sed 's/.*href="//; s/".*//' | \
+                while IFS= read -r link; do
+                  echo "- \`$link\`" >> MANIFEST.md
+                done || true
+              echo "" >> MANIFEST.md
+            fi
+            
+            echo "## Usage:" >> MANIFEST.md
+            echo "View the downloaded page:" >> MANIFEST.md
+            echo '```bash' >> MANIFEST.md
+            echo "cat $OUTPUT_NAME" >> MANIFEST.md
+            echo '```' >> MANIFEST.md
+            
+            echo "✓ Manifest created successfully"
+            
+          else
+            echo "✗ Download failed - file is empty or missing"
+            exit 1
+          fi
+          
+          # Cleanup sensitive files
+          rm -f cookies.txt login_response.html
+          
+          # List final contents
+          echo ""
+          echo "Download directory contents:"
+          ls -la
+          
+          cd ..
+          
+          echo "✓ Download process completed successfully"
+      
+      - name: Push file to repository
+        if: github.event.inputs.push_to_repo == 'true' && success()
+        shell: bash
+        run: |
+          # Find the download directory
+          DOWNLOAD_DIR=$(ls -d mpg_download_* 2>/dev/null | head -1)
+          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
+            echo "No download directory found"
+            exit 1
+          fi
+          
+          echo "Found download directory: $DOWNLOAD_DIR"
+          
+          # Get the current branch
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "Current branch: $BRANCH"
+          
+          # Add the directory to git
+          git add "$DOWNLOAD_DIR"
+          
+          # Commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Download MPG dataset files [skip ci]"
+            git push origin "HEAD:$BRANCH"
+            echo "✓ Files pushed successfully!"
+          fi
+          
+          echo "Download directory: $DOWNLOAD_DIR"
