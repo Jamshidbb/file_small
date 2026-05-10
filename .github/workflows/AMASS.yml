@@ -17,6 +17,17 @@ on:
         required: true
         type: string
         default: 'https://amass.is.tue.mpg.de/download.php'
+      download_filter:
+        description: 'Download filter'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - smplx_g_only
+          - smplx_only
+          - smplh_only
+          - no_renders
       exclude_renders:
         description: 'Exclude render files?'
         required: false
@@ -50,6 +61,7 @@ jobs:
           USERNAME: ${{ github.event.inputs.username }}
           PASSWORD: ${{ github.event.inputs.password }}
           DOWNLOAD_URL: ${{ github.event.inputs.download_url }}
+          DOWNLOAD_FILTER: ${{ github.event.inputs.download_filter }}
           EXCLUDE_RENDERS: ${{ github.event.inputs.exclude_renders }}
         shell: bash
         run: |
@@ -57,11 +69,21 @@ jobs:
           BASE_URL=$(echo "$DOWNLOAD_URL" | grep -oE 'https?://[^/]+')
           
           echo "Base URL: $BASE_URL"
+          echo "Download Filter: $DOWNLOAD_FILTER"
           echo "Exclude Renders: $EXCLUDE_RENDERS"
           
           # Create download directory
+          FILTER_SUFFIX=""
+          case "$DOWNLOAD_FILTER" in
+            "smplx_g_only") FILTER_SUFFIX="_smplx_g" ;;
+            "smplx_only") FILTER_SUFFIX="_smplx_only" ;;
+            "smplh_only") FILTER_SUFFIX="_smplh_only" ;;
+            "no_renders") FILTER_SUFFIX="_no_renders" ;;
+            *) FILTER_SUFFIX="" ;;
+          esac
+          
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          DOWNLOAD_DIR="amass_datasets_${TIMESTAMP}"
+          DOWNLOAD_DIR="amass_datasets_${TIMESTAMP}${FILTER_SUFFIX}"
           mkdir -p "$DOWNLOAD_DIR"
           cd "$DOWNLOAD_DIR"
           
@@ -91,7 +113,7 @@ jobs:
             -o download_page.html \
             "$DOWNLOAD_URL"
           
-          # Extract all download links from onclick handlers and hrefs
+          # Extract all download links
           echo "Extracting download links..."
           
           # Method 1: Extract from onclick="openModalLicense('URL', ...)"
@@ -103,49 +125,90 @@ jobs:
           # Combine and deduplicate
           cat links_onclick.txt | sort -u > all_links.txt
           
-          # Filter out renders if requested
-          if [ "$EXCLUDE_RENDERS" = "true" ]; then
-            grep -v -i "render" all_links.txt > links.txt
-          else
-            cp all_links.txt links.txt
+          # Apply filters based on selection
+          echo "Applying filter: $DOWNLOAD_FILTER"
+          
+          # Start with all links
+          cp all_links.txt filtered_links.txt
+          
+          # Apply filter logic
+          case "$DOWNLOAD_FILTER" in
+            "smplx_g_only")
+              echo "Filtering: Keeping only SMPL-X G files..."
+              grep -i "smplx.*gendered\|smplx.*gender_specific" filtered_links.txt > temp.txt
+              mv temp.txt filtered_links.txt
+              grep -v -i "neutral" filtered_links.txt > temp.txt
+              mv temp.txt filtered_links.txt
+              ;;
+            "smplx_only")
+              echo "Filtering: Keeping only SMPL-X files..."
+              grep -i "smplx" filtered_links.txt > temp.txt
+              mv temp.txt filtered_links.txt
+              ;;
+            "smplh_only")
+              echo "Filtering: Keeping only SMPL+H files..."
+              grep -i "smplh" filtered_links.txt > temp.txt
+              mv temp.txt filtered_links.txt
+              ;;
+            "no_renders")
+              echo "Filtering: Excluding renders..."
+              grep -v -i "render\|mp4" filtered_links.txt > temp.txt
+              mv temp.txt filtered_links.txt
+              ;;
+            "all")
+              echo "Filtering: Keeping all files..."
+              ;;
+          esac
+          
+          # Additional: Exclude renders if checkbox is checked
+          if [ "$EXCLUDE_RENDERS" = "true" ] && [ "$DOWNLOAD_FILTER" != "no_renders" ]; then
+            echo "Additionally excluding render files..."
+            grep -v -i "render\|mp4" filtered_links.txt > temp.txt
+            mv temp.txt filtered_links.txt
           fi
+          
+          # Save the final link list
+          cp filtered_links.txt links.txt
           
           total_links=$(wc -l < links.txt)
           echo "Found $total_links files to download"
           
           if [ $total_links -eq 0 ]; then
-            echo "No links found! Debugging:"
-            echo "First 50 lines of download_page.html:"
-            head -50 download_page.html
+            echo "No links found with current filter!"
+            echo "Debug: Showing all available links (first 20):"
+            head -20 all_links.txt
             exit 1
           fi
           
-          echo "Sample links:"
-          head -3 links.txt
+          echo "Sample links (first 5):"
+          head -5 links.txt
           
           # Function to extract filename from URL
           get_filename() {
             local url="$1"
             local filename=""
             
-            # Extract sfile parameter
             if [[ "$url" =~ sfile=([^&]+) ]]; then
               filename="${BASH_REMATCH[1]}"
               filename=$(echo "$filename" | sed 's/%2F/\//g' | rev | cut -d'/' -f1 | rev)
             fi
             
-            # Extract file parameter
             if [ -z "$filename" ] && [[ "$url" =~ file=([^&]+) ]]; then
               filename="${BASH_REMATCH[1]}"
               filename=$(echo "$filename" | sed 's/%2F/\//g' | rev | cut -d'/' -f1 | rev)
             fi
             
-            # Default name
             if [ -z "$filename" ]; then
               filename="download_$(echo "$url" | md5sum | cut -d' ' -f1).tar.bz2"
             fi
             
             echo "$filename"
+          }
+          
+          # Function to determine dataset name from filename
+          get_dataset_name() {
+            local filename="$1"
+            echo "$filename" | grep -oE '^[A-Za-z0-9]+' || echo "unknown"
           }
           
           # Function to download with retry
@@ -155,7 +218,6 @@ jobs:
             local max_retries=3
             local retry_delay=10
             
-            # URL encode the URL properly
             encoded_url=$(echo "$url" | sed 's/&amp;/\&/g')
             
             for i in $(seq 1 $max_retries); do
@@ -193,7 +255,7 @@ jobs:
             return 1
           }
           
-          # Download each file
+          # Create dataset directories and organize downloads
           echo ""
           echo "Starting downloads..."
           echo "======================"
@@ -202,30 +264,35 @@ jobs:
           failed=0
           current=0
           
+          declare -A dataset_files
+          
           while IFS= read -r link; do
             current=$((current + 1))
             filename=$(get_filename "$link")
+            dataset=$(get_dataset_name "$filename")
+            
+            mkdir -p "$dataset"
+            filepath="$dataset/$filename"
             
             echo ""
-            echo "[$current/$total_links] Downloading: $filename"
+            echo "[$current/$total_links] Downloading: $dataset/$filename"
             
-            if [ -f "$filename" ]; then
+            if [ -f "$filepath" ]; then
               echo "  File already exists, skipping..."
               successful=$((successful + 1))
               continue
             fi
             
-            if download_file "$link" "$filename"; then
+            if download_file "$link" "$filepath"; then
               successful=$((successful + 1))
-              # Calculate checksums
-              md5sum "$filename" > "${filename}.md5" 2>/dev/null || true
-              sha256sum "$filename" > "${filename}.sha256" 2>/dev/null || true
+              md5sum "$filepath" > "${filepath}.md5" 2>/dev/null || true
+              sha256sum "$filepath" > "${filepath}.sha256" 2>/dev/null || true
+              dataset_files["$dataset"]="${dataset_files[$dataset]} $filename"
             else
               failed=$((failed + 1))
-              echo "$filename - $link" >> failed_downloads.txt
+              echo "$dataset/$filename - $link" >> failed_downloads.txt
             fi
             
-            # Small delay between downloads
             sleep 2
           done < links.txt
           
@@ -237,31 +304,73 @@ jobs:
           echo "  Failed: $failed"
           echo "  Total: $total_links"
           
-          # Create manifest
+          # Create manifest file using echo (simpler, avoids YAML issues)
           echo "# AMASS Dataset Download" > MANIFEST.md
           echo "" >> MANIFEST.md
           echo "## Download Information" >> MANIFEST.md
+          echo "" >> MANIFEST.md
           echo "- **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
           echo "- **Source:** $DOWNLOAD_URL" >> MANIFEST.md
+          echo "- **Filter:** $DOWNLOAD_FILTER" >> MANIFEST.md
           echo "- **Exclude Renders:** $EXCLUDE_RENDERS" >> MANIFEST.md
           echo "" >> MANIFEST.md
-          echo "## Downloaded Files" >> MANIFEST.md
+          echo "## Filter Details" >> MANIFEST.md
           echo "" >> MANIFEST.md
           
-          # List all downloaded files
-          for file in *.tar.bz2 *.zip *.bz2; do
-            if [ -f "$file" ] && [ ! "$file" = "*.tar.bz2" ] && [ ! "$file" = "*.zip" ] && [ ! "$file" = "*.bz2" ]; then
-              size=$(du -h "$file" | cut -f1)
-              echo "- **$file** ($size)" >> MANIFEST.md
-              if [ -f "${file}.md5" ]; then
-                echo "  - MD5: $(cat "${file}.md5" | cut -d' ' -f1)" >> MANIFEST.md
-              fi
+          case "$DOWNLOAD_FILTER" in
+            "smplx_g_only")
+              echo "- **SMPL-X Gendered only**: Only SMPL-X models with **gendered** body shapes (male/female separate)" >> MANIFEST.md
+              echo "- **Neutral models excluded**" >> MANIFEST.md
+              echo "- **SMPL+H models excluded**" >> MANIFEST.md
+              ;;
+            "smplx_only")
+              echo "- **All SMPL-X**: Both gendered (G) and neutral (N) variants" >> MANIFEST.md
+              echo "- **SMPL+H models excluded**" >> MANIFEST.md
+              ;;
+            "smplh_only")
+              echo "- **All SMPL+H**: Both gendered (G) and neutral (N) variants" >> MANIFEST.md
+              echo "- **SMPL-X models excluded**" >> MANIFEST.md
+              ;;
+            "no_renders")
+              echo "- **All models except renders**: SMPL+H and SMPL-X, both gendered and neutral" >> MANIFEST.md
+              echo "- **Render/MP4 files excluded**" >> MANIFEST.md
+              ;;
+            "all")
+              echo "- **All files**: Complete AMASS dataset including all variants and renders" >> MANIFEST.md
+              ;;
+          esac
+          
+          echo "" >> MANIFEST.md
+          echo "## Downloaded Files by Dataset" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          
+          for dataset_dir in */; do
+            dataset_dir="${dataset_dir%/}"
+            if [ "$dataset_dir" != "*" ] && [ -d "$dataset_dir" ]; then
+              echo "### $dataset_dir" >> MANIFEST.md
+              echo "" >> MANIFEST.md
+              echo "| File | Size | MD5 |" >> MANIFEST.md
+              echo "|------|------|-----|" >> MANIFEST.md
+              
+              for file in "$dataset_dir"/*.tar.bz2 "$dataset_dir"/*.zip 2>/dev/null; do
+                if [ -f "$file" ]; then
+                  size=$(du -h "$file" | cut -f1)
+                  filename=$(basename "$file")
+                  md5_val=""
+                  if [ -f "${file}.md5" ]; then
+                    md5_val=$(cat "${file}.md5" | cut -d' ' -f1)
+                  fi
+                  echo "| $filename | $size | $md5_val |" >> MANIFEST.md
+                fi
+              done
+              echo "" >> MANIFEST.md
             fi
           done
           
           if [ -f failed_downloads.txt ] && [ -s failed_downloads.txt ]; then
             echo "" >> MANIFEST.md
             echo "## Failed Downloads" >> MANIFEST.md
+            echo "" >> MANIFEST.md
             echo '```' >> MANIFEST.md
             cat failed_downloads.txt >> MANIFEST.md
             echo '```' >> MANIFEST.md
@@ -269,22 +378,27 @@ jobs:
           
           echo "" >> MANIFEST.md
           echo "## Usage" >> MANIFEST.md
-          echo '```bash' >> MANIFEST.md
-          echo "# Extract tar.bz2 files" >> MANIFEST.md
-          echo "tar -xjf filename.tar.bz2" >> MANIFEST.md
           echo "" >> MANIFEST.md
-          echo "# Extract zip files" >> MANIFEST.md
-          echo "unzip filename.zip" >> MANIFEST.md
+          echo '```bash' >> MANIFEST.md
+          echo "# Navigate to a dataset directory" >> MANIFEST.md
+          echo "cd ACCAD" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          echo "# Extract tar.bz2 files" >> MANIFEST.md
+          echo "tar -xjf ACCAD_SMPL-X_G.tar.bz2" >> MANIFEST.md
+          echo "" >> MANIFEST.md
+          echo "# Verify integrity" >> MANIFEST.md
+          echo "md5sum -c *.md5" >> MANIFEST.md
           echo '```' >> MANIFEST.md
           
           # Cleanup
-          rm -f cookies.txt login_response.html download_page.html all_links.txt links.txt links_onclick.txt http_code.txt 2>/dev/null || true
+          rm -f cookies.txt login_response.html download_page.html all_links.txt filtered_links.txt links.txt links_onclick.txt temp.txt 2>/dev/null || true
           
           cd ..
           
           echo ""
           echo "✓ Download process completed!"
           echo "Files saved in: $DOWNLOAD_DIR"
+          echo "Manifest: $DOWNLOAD_DIR/MANIFEST.md"
           
           if [ $failed -gt 0 ]; then
             echo "⚠ $failed files failed to download"
@@ -303,6 +417,18 @@ jobs:
           
           echo "Download directory: $DOWNLOAD_DIR"
           
+          # Check if files are too large for GitHub
+          echo "Checking file sizes..."
+          LARGE_FILES=$(find "$DOWNLOAD_DIR" -type f -size +95M 2>/dev/null)
+          if [ -n "$LARGE_FILES" ]; then
+            echo "⚠ WARNING: Some files exceed 95MB and may not push to GitHub:"
+            echo "$LARGE_FILES" | while read -r file; do
+              echo "  - $file ($(du -h "$file" | cut -f1))"
+            done
+            echo ""
+            echo "Consider using Git LFS or a different storage solution for large files."
+          fi
+          
           # Get the current branch
           BRANCH="${GITHUB_REF#refs/heads/}"
           
@@ -312,7 +438,32 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Download AMASS datasets [skip ci]"
+            git commit -m "Download AMASS datasets (filter: ${{ github.event.inputs.download_filter }}) [skip ci]"
             git push origin "HEAD:$BRANCH"
             echo "✓ Files pushed successfully!"
+          fi
+      
+      - name: Display download summary
+        if: always()
+        shell: bash
+        run: |
+          DOWNLOAD_DIR=$(ls -d amass_datasets_* 2>/dev/null | head -1)
+          if [ -n "$DOWNLOAD_DIR" ] && [ -d "$DOWNLOAD_DIR" ]; then
+            echo "=========================================="
+            echo "📦 AMASS Dataset Download Complete"
+            echo "=========================================="
+            echo "Location: $DOWNLOAD_DIR"
+            echo ""
+            echo "Dataset sizes:"
+            for dataset_dir in "$DOWNLOAD_DIR"/*/; do
+              if [ -d "$dataset_dir" ]; then
+                dataset_name=$(basename "$dataset_dir")
+                size=$(du -sh "$dataset_dir" | cut -f1)
+                files=$(find "$dataset_dir" -type f \( -name "*.tar.bz2" -o -name "*.zip" \) 2>/dev/null | wc -l)
+                echo "  📁 $dataset_name: $size ($files files)"
+              fi
+            done
+            echo ""
+            echo "Manifest: $DOWNLOAD_DIR/MANIFEST.md"
+            echo "=========================================="
           fi
