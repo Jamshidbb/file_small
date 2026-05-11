@@ -53,8 +53,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      
+          
       - name: Login and download file
+        id: download
         env:
           USERNAME: ${{ github.event.inputs.username }}
           PASSWORD: ${{ github.event.inputs.password }}
@@ -76,6 +77,10 @@ jobs:
           DOWNLOAD_DIR="mpg_download_${TIMESTAMP}"
           mkdir -p "$DOWNLOAD_DIR"
           cd "$DOWNLOAD_DIR"
+          
+          # Save directory name for later steps
+          echo "DOWNLOAD_DIR=$DOWNLOAD_DIR" >> $GITHUB_ENV
+          echo "DOWNLOAD_PATH=$(pwd)" >> $GITHUB_ENV
           
           # Construct login URL
           LOGIN_URL="${BASE_LOGIN_URL}/login.php"
@@ -121,6 +126,7 @@ jobs:
           fi
           
           echo "Output file: $OUTPUT_NAME"
+          echo "DOWNLOAD_FILE=$OUTPUT_NAME" >> $GITHUB_ENV
           
           # Download with session cookies and follow redirects
           HTTP_CODE=$(curl -L -b cookies.txt -c cookies.txt \
@@ -232,34 +238,110 @@ jobs:
           cd ..
           
           echo "✓ Download process completed successfully"
-      
+          
+      - name: List files before push
+        shell: bash
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Directory contents:"
+          ls -la
+          echo ""
+          echo "Download directory: ${{ env.DOWNLOAD_DIR }}"
+          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -d "${{ env.DOWNLOAD_DIR }}" ]; then
+            echo "Contents of ${{ env.DOWNLOAD_DIR }}:"
+            ls -la "${{ env.DOWNLOAD_DIR }}"
+          else
+            echo "Download directory not found!"
+          fi
+          
       - name: Push file to repository
         if: github.event.inputs.push_to_repo == 'true' && success()
         shell: bash
         run: |
-          # Find the download directory
-          DOWNLOAD_DIR=$(ls -d mpg_download_* 2>/dev/null | head -1)
-          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
-            echo "No download directory found"
-            exit 1
+          # Debug information
+          echo "=== Debug Info ==="
+          echo "Current branch: ${GITHUB_REF#refs/heads/}"
+          echo "Current directory: $(pwd)"
+          echo "Files in current directory:"
+          ls -la
+          echo ""
+          
+          # Find the download directory (should be in env.DOWNLOAD_DIR)
+          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -d "${{ env.DOWNLOAD_DIR }}" ]; then
+            DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
+            echo "Found download directory from env: $DOWNLOAD_DIR"
+          else
+            # Fallback: find the most recent mpg_download_* directory
+            DOWNLOAD_DIR=$(ls -td mpg_download_* 2>/dev/null | head -1)
+            if [ -z "$DOWNLOAD_DIR" ]; then
+              echo "❌ No download directory found!"
+              echo "Available directories:"
+              ls -la
+              exit 1
+            fi
+            echo "Found download directory from ls: $DOWNLOAD_DIR"
           fi
           
-          echo "Found download directory: $DOWNLOAD_DIR"
+          echo "Download directory: $DOWNLOAD_DIR"
+          echo "Contents:"
+          ls -la "$DOWNLOAD_DIR"
+          echo ""
           
           # Get the current branch
           BRANCH="${GITHUB_REF#refs/heads/}"
           echo "Current branch: $BRANCH"
           
-          # Add the directory to git
-          git add "$DOWNLOAD_DIR"
-          
-          # Commit if there are changes
-          if git diff --staged --quiet; then
+          # Check if we have changes to commit
+          if [ -z "$(git status --porcelain)" ]; then
             echo "No changes to commit"
-          else
-            git commit -m "Download MPG dataset files from ${{ github.event.inputs.base_login_url }} [skip ci]"
-            git push origin "HEAD:$BRANCH"
-            echo "✓ Files pushed successfully!"
+            exit 0
           fi
           
-          echo "Download directory: $DOWNLOAD_DIR"
+          # Show what will be committed
+          echo "Changes to commit:"
+          git status --short
+          echo ""
+          
+          # Add the download directory
+          git add "$DOWNLOAD_DIR"
+          
+          # Also add if there's a specific file we should track
+          if [ -n "${{ env.DOWNLOAD_FILE }}" ] && [ -f "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}" ]; then
+            echo "Specifically adding: $DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}"
+            git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}"
+          fi
+          
+          # Commit the changes
+          git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} from ${{ github.event.inputs.base_login_url }} [skip ci]"
+          
+          # Push to the repository
+          echo "Pushing to origin/$BRANCH..."
+          git push origin "HEAD:$BRANCH"
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Files pushed successfully!"
+            echo "Download directory: $DOWNLOAD_DIR"
+            echo "File: ${{ env.DOWNLOAD_FILE }}"
+          else
+            echo "❌ Failed to push to repository"
+            exit 1
+          fi
+          
+      - name: Summary of download
+        if: success()
+        shell: bash
+        run: |
+          echo "## Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Directory:** \`${{ env.DOWNLOAD_DIR }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** \`${{ env.DOWNLOAD_FILE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base URL:** ${{ github.event.inputs.base_login_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pushed to repo:** ${{ github.event.inputs.push_to_repo }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -f "${{ env.DOWNLOAD_DIR }}/MANIFEST.md" ]; then
+            echo "### Manifest Content" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -30 "${{ env.DOWNLOAD_DIR }}/MANIFEST.md" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
