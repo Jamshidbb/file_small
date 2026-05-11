@@ -137,6 +137,7 @@ jobs:
             size=$(du -h "$OUTPUT_NAME" | cut -f1)
             lines=$(wc -l < "$OUTPUT_NAME")
             file_type=$(file "$OUTPUT_NAME")
+            file_type_clean=$(file "$OUTPUT_NAME" | cut -d: -f2- | sed 's/^[[:space:]]*//')
             
             echo "✓ Successfully downloaded: $OUTPUT_NAME"
             echo "  Size: $size"
@@ -165,42 +166,51 @@ jobs:
               echo "----------------------------------------"
             fi
             
-            # Create manifest using printf instead of heredoc
-            printf "# MPG Dataset Download\n\n" > MANIFEST.md
-            printf "**Date:** %s\n\n" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
-            printf "**Base Login URL:** %s\n\n" "$BASE_LOGIN_URL" >> MANIFEST.md
-            printf "**Download URL:** %s\n\n" "$DOWNLOAD_URL" >> MANIFEST.md
-            printf "**HTTP Status:** %s\n\n" "$HTTP_CODE" >> MANIFEST.md
-            printf "**Allow HTML:** %s\n\n" "$ALLOW_HTML" >> MANIFEST.md
-            
-            printf "## Downloaded files:\n\n" >> MANIFEST.md
-            printf "- **%s**\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf "  - Size: %s\n" "$size" >> MANIFEST.md
-            printf "  - Lines: %s\n" "$lines" >> MANIFEST.md
-            printf "  - Type: %s\n\n" "$(file "$OUTPUT_NAME" | cut -d: -f2)" >> MANIFEST.md
-            
-            printf "## Usage:\n\n" >> MANIFEST.md
-            printf '```bash\n' >> MANIFEST.md
-            printf "# Check file type\n" >> MANIFEST.md
-            printf "file %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf "# If it's a tar.bz2 file:\n" >> MANIFEST.md
-            printf "tar -xjf %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf "# If it's a tar.gz file:\n" >> MANIFEST.md
-            printf "tar -xzf %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf "# If it's a zip file:\n" >> MANIFEST.md
-            printf "unzip %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf "# If it's an HTML page (for inspection):\n" >> MANIFEST.md
-            printf "cat %s\n" "$OUTPUT_NAME" >> MANIFEST.md
-            printf '```\n' >> MANIFEST.md
+            # Create manifest using printf with proper escaping
+            {
+              printf "# MPG Dataset Download\n\n"
+              printf "**Date:** %s\n\n" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              printf "**Base Login URL:** %s\n\n" "$BASE_LOGIN_URL"
+              printf "**Download URL:** %s\n\n" "$DOWNLOAD_URL"
+              printf "**HTTP Status:** %s\n\n" "$HTTP_CODE"
+              printf "**Allow HTML:** %s\n\n" "$ALLOW_HTML"
+              
+              printf "## Downloaded files:\n\n"
+              printf -- "- **%s**\n" "$OUTPUT_NAME"
+              printf "  - Size: %s\n" "$size"
+              printf "  - Lines: %s\n" "$lines"
+              printf -- "  - Type: %s\n\n" "$file_type_clean"
+              
+              printf "## Usage:\n\n"
+              printf '```bash\n'
+              printf "# Check file type\n"
+              printf "file %s\n\n" "$OUTPUT_NAME"
+              printf "# If it's a tar.bz2 file:\n"
+              printf "tar -xjf %s\n\n" "$OUTPUT_NAME"
+              printf "# If it's a tar.gz file:\n"
+              printf "tar -xzf %s\n\n" "$OUTPUT_NAME"
+              printf "# If it's a zip file:\n"
+              printf "unzip %s\n\n" "$OUTPUT_NAME"
+              printf "# If it's an HTML page (for inspection):\n"
+              printf "cat %s\n" "$OUTPUT_NAME"
+              printf '```\n'
+            } > MANIFEST.md
             
             # If HTML, extract links for convenience
             if echo "$file_type" | grep -q "HTML document"; then
-              printf "\n## Download links found in page:\n\n" >> MANIFEST.md
-              grep -E 'href="[^"]*\.(zip|tar|gz|tgz|bz2|xz|7z)[^"]*"' "$OUTPUT_NAME" | \
-                sed 's/.*href="//; s/".*//' | \
-                while IFS= read -r link; do
-                  printf "- \`%s\`\n" "$link" >> MANIFEST.md
-                done || printf "- No direct download links found\n" >> MANIFEST.md
+              {
+                printf "\n## Download links found in page:\n\n"
+                grep -E 'href="[^"]*\.(zip|tar|gz|tgz|bz2|xz|7z)[^"]*"' "$OUTPUT_NAME" | \
+                  sed 's/.*href="//; s/".*//' | \
+                  while IFS= read -r link; do
+                    printf -- "- \`%s\`\n" "$link"
+                  done
+              } >> MANIFEST.md
+              
+              # If no links found, add a note
+              if ! grep -q "Download links found" MANIFEST.md; then
+                printf "\n- No direct download links found\n" >> MANIFEST.md
+              fi
             fi
             
             echo "✓ Manifest created successfully"
