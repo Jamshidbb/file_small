@@ -186,6 +186,9 @@ jobs:
             echo "Total parts: $part_count"
             echo "SPLIT_PARTS=$part_count" >> $GITHUB_ENV
             
+            # Store part list for pushing
+            echo "PART_LIST=$(ls ${OUTPUT_NAME}.part* | tr '\n' ' ')" >> $GITHUB_ENV
+            
             # Update manifest
             split_info="**Split into ${part_count} parts (${SPLIT_SIZE} each)**\n\n"
             split_info="${split_info}To reassemble:\n"
@@ -244,11 +247,11 @@ jobs:
           cd ..
           echo "✓ Download process completed successfully"
           
-      - name: Push file to repository
+      - name: Push manifest and helper files
         if: github.event.inputs.push_to_repo == 'true' && success()
         shell: bash
         run: |
-          echo "=== Pushing to Repository ==="
+          echo "=== Pushing Manifest and Helper Files ==="
           
           # Find the download directory
           DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
@@ -269,18 +272,14 @@ jobs:
           # Configure git for large files
           git config http.postBuffer 524288000
           
-          # Check if we have changes
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes to commit"
-            exit 0
-          fi
+          # Set remote URL with token
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
-          # Push manifest first
+          # Push manifest
           if [ -f "$DOWNLOAD_DIR/MANIFEST.md" ]; then
             echo "Pushing MANIFEST.md..."
             git add "$DOWNLOAD_DIR/MANIFEST.md"
             git commit -m "Add MANIFEST.md for MPG dataset [skip ci]"
-            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push "$REMOTE_URL" "HEAD:$BRANCH"
           fi
           
@@ -289,7 +288,6 @@ jobs:
             echo "Pushing reassembly script..."
             git add "$DOWNLOAD_DIR"/reassemble_*.sh
             git commit -m "Add reassembly script for MPG dataset [skip ci]"
-            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push "$REMOTE_URL" "HEAD:$BRANCH"
           fi
           
@@ -298,25 +296,131 @@ jobs:
             echo "Pushing MD5 checksum..."
             git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}.md5"
             git commit -m "Add MD5 checksum for MPG dataset [skip ci]"
-            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push "$REMOTE_URL" "HEAD:$BRANCH"
           fi
           
-          # Push all split parts at once (simpler and avoids YAML issues)
-          echo "Adding all split parts..."
-          git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}.part"* 2>/dev/null || true
+      - name: Push split parts one by one
+        if: github.event.inputs.push_to_repo == 'true' && success() && env.PART_LIST != ''
+        shell: bash
+        run: |
+          echo "=== Pushing Split Parts One by One ==="
           
-          # Commit all parts together
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} [skip ci]"
-            echo "Pushing to repository..."
-            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Find the download directory
+          DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
+          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
+            DOWNLOAD_DIR=$(ls -td mpg_download_* 2>/dev/null | head -1)
+            if [ -z "$DOWNLOAD_DIR" ]; then
+              echo "No download directory found!"
+              exit 1
+            fi
+          fi
+          
+          echo "Download directory: $DOWNLOAD_DIR"
+          
+          # Get the current branch
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "Current branch: $BRANCH"
+          
+          # Set remote URL with token
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          # Get list of split parts
+          cd "$DOWNLOAD_DIR"
+          PART_FILES=$(ls ${{ env.DOWNLOAD_FILE }}.part* 2>/dev/null || true)
+          
+          if [ -z "$PART_FILES" ]; then
+            echo "No split parts found to push"
+            exit 0
+          fi
+          
+          echo "Found split parts:"
+          echo "$PART_FILES"
+          
+          # Push each part individually
+          PART_NUMBER=1
+          TOTAL_PARTS=$(echo "$PART_FILES" | wc -l)
+          
+          for PART in $PART_FILES; do
+            echo ""
+            echo "----------------------------------------"
+            echo "Pushing part $PART_NUMBER of $TOTAL_PARTS: $PART"
+            echo "----------------------------------------"
+            
+            # Add and commit this single part
+            git add "$PART"
+            git commit -m "Add $PART (part $PART_NUMBER/$TOTAL_PARTS) of ${{ env.DOWNLOAD_FILE }} [skip ci]"
+            
+            # Push this part
             if git push "$REMOTE_URL" "HEAD:$BRANCH"; then
-              echo "Files pushed successfully!"
+              echo "✓ Successfully pushed $PART"
             else
-              echo "Push failed"
+              echo "✗ Failed to push $PART"
+              echo "Retrying with pull first..."
+              git pull "$REMOTE_URL" "$BRANCH" --rebase
+              if git push "$REMOTE_URL" "HEAD:$BRANCH"; then
+                echo "✓ Successfully pushed $PART after rebase"
+              else
+                echo "✗ Still failed to push $PART"
+                exit 1
+              fi
+            fi
+            
+            PART_NUMBER=$((PART_NUMBER + 1))
+          done
+          
+          echo ""
+          echo "========================================"
+          echo "✓ All $TOTAL_PARTS parts pushed successfully!"
+          echo "========================================"
+          
+      - name: Push single file (if not split)
+        if: github.event.inputs.push_to_repo == 'true' && success() && env.PART_LIST == ''
+        shell: bash
+        run: |
+          echo "=== Pushing Single File ==="
+          
+          # Find the download directory
+          DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
+          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
+            DOWNLOAD_DIR=$(ls -td mpg_download_* 2>/dev/null | head -1)
+            if [ -z "$DOWNLOAD_DIR" ]; then
+              echo "No download directory found!"
+              exit 1
+            fi
+          fi
+          
+          echo "Download directory: $DOWNLOAD_DIR"
+          
+          # Get the current branch
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "Current branch: $BRANCH"
+          
+          # Configure git for large files
+          git config http.postBuffer 524288000
+          
+          # Set remote URL with token
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          # Add and push the downloaded file
+          if [ -f "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}" ]; then
+            echo "Adding ${{ env.DOWNLOAD_FILE }}..."
+            git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}"
+            
+            # Check if file is too large for GitHub
+            FILE_SIZE=$(stat -c%s "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}" 2>/dev/null || stat -f%z "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}" 2>/dev/null)
+            if [ "$FILE_SIZE" -gt 104857600 ]; then
+              echo "⚠ Warning: File is larger than 100MB ($(numfmt --to=iec $FILE_SIZE))"
+              echo "This may fail to push. Consider using split_size in future downloads."
+            fi
+            
+            git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} [skip ci]"
+            
+            if git push "$REMOTE_URL" "HEAD:$BRANCH"; then
+              echo "✓ Successfully pushed ${{ env.DOWNLOAD_FILE }}"
+            else
+              echo "✗ Failed to push file (may exceed GitHub size limit)"
               exit 1
             fi
           else
-            echo "No new files to push"
+            echo "No file to push"
           fi
