@@ -36,6 +36,11 @@ on:
         required: false
         type: boolean
         default: true
+      split_size:
+        description: 'Split size for large files (e.g., 95m, 50m) - empty to disable splitting'
+        required: false
+        type: string
+        default: '95m'
 
 jobs:
   download-single-file:
@@ -63,6 +68,7 @@ jobs:
           DOWNLOAD_URL: ${{ github.event.inputs.download_url }}
           OUTPUT_NAME: ${{ github.event.inputs.output_filename }}
           ALLOW_HTML: ${{ github.event.inputs.allow_html }}
+          SPLIT_SIZE: ${{ github.event.inputs.split_size }}
         shell: bash
         run: |
           # Remove trailing slash if present
@@ -71,6 +77,7 @@ jobs:
           echo "Base Login URL: $BASE_LOGIN_URL"
           echo "Download URL: $DOWNLOAD_URL"
           echo "Allow HTML: $ALLOW_HTML"
+          echo "Split size: $SPLIT_SIZE"
           
           # Create download directory
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -94,32 +101,28 @@ jobs:
             -d "commit=Log in" \
             "$LOGIN_URL" -o login_response.html
           
-          # Verify login (look for common success indicators)
+          # Verify login
           if grep -q -i "logout\|dashboard\|account\|welcome" login_response.html; then
             echo "✓ Login successful"
           else
             echo "✗ Login failed"
-            echo "Response preview:"
             head -20 login_response.html
             exit 1
           fi
           
-          # Download the requested file/page
+          # Download the requested file
           echo "Downloading from: $DOWNLOAD_URL"
           
           # Determine output filename
           if [ -z "$OUTPUT_NAME" ]; then
-            # Try to extract from sfile parameter if present
             if [[ "$DOWNLOAD_URL" == *"sfile="* ]]; then
               OUTPUT_NAME=$(echo "$DOWNLOAD_URL" | grep -oP 'sfile=\K[^&]+' | sed 's/%2F/\//g' | xargs basename)
             fi
             
-            # If still empty, try basename of URL
             if [ -z "$OUTPUT_NAME" ]; then
               OUTPUT_NAME=$(basename "$DOWNLOAD_URL" | sed 's/?.*//')
             fi
             
-            # Final fallback
             if [ -z "$OUTPUT_NAME" ] || [ "$OUTPUT_NAME" = "download.php" ] || [ "$OUTPUT_NAME" = "download" ]; then
               OUTPUT_NAME="downloaded_file"
             fi
@@ -128,7 +131,7 @@ jobs:
           echo "Output file: $OUTPUT_NAME"
           echo "DOWNLOAD_FILE=$OUTPUT_NAME" >> $GITHUB_ENV
           
-          # Download with session cookies and follow redirects
+          # Download with session cookies
           HTTP_CODE=$(curl -L -b cookies.txt -c cookies.txt \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
             -H "Referer: ${BASE_LOGIN_URL}/" \
@@ -139,147 +142,122 @@ jobs:
           echo "HTTP Status: $HTTP_CODE"
           
           # Check if download was successful
-          if [ -f "$OUTPUT_NAME" ] && [ -s "$OUTPUT_NAME" ]; then
-            size=$(du -h "$OUTPUT_NAME" | cut -f1)
-            lines=$(wc -l < "$OUTPUT_NAME")
-            file_type=$(file "$OUTPUT_NAME")
-            file_type_clean=$(file "$OUTPUT_NAME" | cut -d: -f2- | sed 's/^[[:space:]]*//')
-            
-            echo "✓ Successfully downloaded: $OUTPUT_NAME"
-            echo "  Size: $size"
-            echo "  Lines: $lines"
-            echo "  Type: $file_type"
-            
-            # Check if it's HTML and we didn't allow it
-            if echo "$file_type" | grep -q "HTML document"; then
-              if [ "$ALLOW_HTML" = "false" ]; then
-                echo "⚠ Warning: Downloaded HTML page instead of binary file"
-                echo "  This usually means:"
-                echo "    1. Login failed (check credentials)"
-                echo "    2. Wrong base login URL (tried: $BASE_LOGIN_URL)"
-                echo "    3. File requires additional permissions"
-                echo ""
-                echo "  If you intentionally want HTML pages, set 'allow_html' to true"
-              else
-                echo "✓ HTML page download allowed"
-              fi
-              
-              # Show preview
-              echo ""
-              echo "Page preview (first 10 lines):"
-              echo "----------------------------------------"
-              head -10 "$OUTPUT_NAME"
-              echo "----------------------------------------"
-            fi
-            
-            # Create manifest using printf with proper escaping
-            {
-              printf "# MPG Dataset Download\n\n"
-              printf "**Date:** %s\n\n" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-              printf "**Base Login URL:** %s\n\n" "$BASE_LOGIN_URL"
-              printf "**Download URL:** %s\n\n" "$DOWNLOAD_URL"
-              printf "**HTTP Status:** %s\n\n" "$HTTP_CODE"
-              printf "**Allow HTML:** %s\n\n" "$ALLOW_HTML"
-              
-              printf "## Downloaded files:\n\n"
-              printf -- "- **%s**\n" "$OUTPUT_NAME"
-              printf "  - Size: %s\n" "$size"
-              printf "  - Lines: %s\n" "$lines"
-              printf -- "  - Type: %s\n\n" "$file_type_clean"
-              
-              printf "## Usage:\n\n"
-              printf '```bash\n'
-              printf "# Check file type\n"
-              printf "file %s\n\n" "$OUTPUT_NAME"
-              printf "# If it's a tar.bz2 file:\n"
-              printf "tar -xjf %s\n\n" "$OUTPUT_NAME"
-              printf "# If it's a tar.gz file:\n"
-              printf "tar -xzf %s\n\n" "$OUTPUT_NAME"
-              printf "# If it's a zip file:\n"
-              printf "unzip %s\n\n" "$OUTPUT_NAME"
-              printf "# If it's an HTML page (for inspection):\n"
-              printf "cat %s\n" "$OUTPUT_NAME"
-              printf '```\n'
-            } > MANIFEST.md
-            
-            # If HTML, extract links for convenience
-            if echo "$file_type" | grep -q "HTML document"; then
-              {
-                printf "\n## Download links found in page:\n\n"
-                grep -E 'href="[^"]*\.(zip|tar|gz|tgz|bz2|xz|7z)[^"]*"' "$OUTPUT_NAME" | \
-                  sed 's/.*href="//; s/".*//' | \
-                  while IFS= read -r link; do
-                    printf -- "- \`%s\`\n" "$link"
-                  done
-              } >> MANIFEST.md
-              
-              # If no links found, add a note
-              if ! grep -q "Download links found" MANIFEST.md; then
-                printf "\n- No direct download links found\n" >> MANIFEST.md
-              fi
-            fi
-            
-            echo "✓ Manifest created successfully"
-            
-          else
-            echo "✗ Download failed - file is empty or missing"
-            echo "HTTP Status: $HTTP_CODE"
+          if [ ! -f "$OUTPUT_NAME" ] || [ ! -s "$OUTPUT_NAME" ]; then
+            echo "✗ Download failed"
             exit 1
           fi
           
-          # Cleanup sensitive files
+          size=$(du -h "$OUTPUT_NAME" | cut -f1)
+          size_bytes=$(stat -c%s "$OUTPUT_NAME")
+          echo "✓ Successfully downloaded: $OUTPUT_NAME"
+          echo "  Size: $size ($size_bytes bytes)"
+          
+          # Split file if it's large
+          if [ -n "$SPLIT_SIZE" ] && [ "$size_bytes" -gt 104857600 ]; then
+            echo ""
+            echo "⚠ File exceeds GitHub's 100MB limit ($size)"
+            echo "Splitting into ${SPLIT_SIZE} chunks..."
+            
+            # Split the file
+            split -b "$SPLIT_SIZE" -d "$OUTPUT_NAME" "${OUTPUT_NAME}.part"
+            
+            # Create reassembly script
+            reassemble_script="reassemble_${OUTPUT_NAME}.sh"
+            echo '#!/bin/bash' > "$reassemble_script"
+            echo '# Reassemble the split file' >> "$reassemble_script"
+            echo "cat ${OUTPUT_NAME}.part* > ${OUTPUT_NAME}" >> "$reassemble_script"
+            echo 'echo "✓ Reassembled ${0%.sh}"' >> "$reassemble_script"
+            echo 'echo "Verify with: md5sum -c ${0%.sh}.md5"' >> "$reassemble_script"
+            chmod +x "$reassemble_script"
+            
+            # Calculate MD5 of original
+            md5sum "$OUTPUT_NAME" > "${OUTPUT_NAME}.md5"
+            
+            # Remove original large file
+            rm "$OUTPUT_NAME"
+            
+            # List split parts
+            echo ""
+            echo "Created split parts:"
+            ls -lh "${OUTPUT_NAME}.part"*
+            
+            # Count parts
+            part_count=$(ls "${OUTPUT_NAME}.part"* 2>/dev/null | wc -l)
+            echo "Total parts: $part_count"
+            echo "SPLIT_PARTS=$part_count" >> $GITHUB_ENV
+            
+            # Update manifest
+            split_info="**Split into ${part_count} parts (${SPLIT_SIZE} each)**\n\n"
+            split_info="${split_info}To reassemble:\n"
+            split_info="${split_info}\`\`\`bash\n"
+            split_info="${split_info}bash reassemble_${OUTPUT_NAME}.sh\n"
+            split_info="${split_info}md5sum -c ${OUTPUT_NAME}.md5\n"
+            split_info="${split_info}\`\`\`\n"
+          else
+            split_info=""
+          fi
+          
+          # Create manifest
+          {
+            printf "# MPG Dataset Download\n\n"
+            printf "**Date:** %s\n\n" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            printf "**Base Login URL:** %s\n\n" "$BASE_LOGIN_URL"
+            printf "**Download URL:** %s\n\n" "$DOWNLOAD_URL"
+            printf "**HTTP Status:** %s\n\n" "$HTTP_CODE"
+            printf "**Original Size:** %s (%s bytes)\n\n" "$size" "$size_bytes"
+            
+            printf "## Downloaded files:\n\n"
+            
+            if [ -n "$SPLIT_SIZE" ] && [ "$size_bytes" -gt 104857600 ]; then
+              printf "**File was split due to GitHub size limit (100MB)**\n\n"
+              printf "### Split parts:\n"
+              for part in ${OUTPUT_NAME}.part*; do
+                part_size=$(du -h "$part" | cut -f1)
+                printf -- "- \`%s\` (%s)\n" "$part" "$part_size"
+              done
+              printf "\n%s" "$split_info"
+            else
+              printf -- "- **%s** (%s)\n" "$OUTPUT_NAME" "$size"
+            fi
+            
+            printf "\n## Usage:\n\n"
+            printf '```bash\n'
+            printf "# Extract the dataset\n"
+            if [ -n "$SPLIT_SIZE" ] && [ "$size_bytes" -gt 104857600 ]; then
+              printf "# First reassemble the file:\n"
+              printf "bash reassemble_%s.sh\n\n" "$OUTPUT_NAME"
+              printf "# Then extract:\n"
+              printf "tar -xjf %s\n" "$OUTPUT_NAME"
+            else
+              printf "tar -xjf %s\n" "$OUTPUT_NAME"
+            fi
+            printf '```\n'
+          } > MANIFEST.md
+          
+          # Cleanup
           rm -f cookies.txt login_response.html
           
-          # List final contents
           echo ""
           echo "Download directory contents:"
           ls -la
           
           cd ..
-          
           echo "✓ Download process completed successfully"
-          
-      - name: List files before push
-        shell: bash
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Directory contents:"
-          ls -la
-          echo ""
-          echo "Download directory: ${{ env.DOWNLOAD_DIR }}"
-          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -d "${{ env.DOWNLOAD_DIR }}" ]; then
-            echo "Contents of ${{ env.DOWNLOAD_DIR }}:"
-            ls -la "${{ env.DOWNLOAD_DIR }}"
-          else
-            echo "Download directory not found!"
-          fi
           
       - name: Push file to repository
         if: github.event.inputs.push_to_repo == 'true' && success()
         shell: bash
         run: |
-          # Debug information
-          echo "=== Debug Info ==="
-          echo "Current branch: ${GITHUB_REF#refs/heads/}"
-          echo "Current directory: $(pwd)"
-          echo "Files in current directory:"
-          ls -la
-          echo ""
+          echo "=== Pushing to Repository ==="
           
-          # Find the download directory (should be in env.DOWNLOAD_DIR)
-          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -d "${{ env.DOWNLOAD_DIR }}" ]; then
-            DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
-            echo "Found download directory from env: $DOWNLOAD_DIR"
-          else
-            # Fallback: find the most recent mpg_download_* directory
+          # Find the download directory
+          DOWNLOAD_DIR="${{ env.DOWNLOAD_DIR }}"
+          if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
             DOWNLOAD_DIR=$(ls -td mpg_download_* 2>/dev/null | head -1)
             if [ -z "$DOWNLOAD_DIR" ]; then
               echo "❌ No download directory found!"
-              echo "Available directories:"
-              ls -la
               exit 1
             fi
-            echo "Found download directory from ls: $DOWNLOAD_DIR"
           fi
           
           echo "Download directory: $DOWNLOAD_DIR"
@@ -291,57 +269,40 @@ jobs:
           BRANCH="${GITHUB_REF#refs/heads/}"
           echo "Current branch: $BRANCH"
           
-          # Check if we have changes to commit
+          # Configure git for large files
+          git config http.postBuffer 524288000
+          
+          # Check if we have changes
           if [ -z "$(git status --porcelain)" ]; then
             echo "No changes to commit"
             exit 0
           fi
           
-          # Show what will be committed
-          echo "Changes to commit:"
-          git status --short
-          echo ""
-          
-          # Add the download directory
+          # Add all files in the download directory
           git add "$DOWNLOAD_DIR"
           
-          # Also add if there's a specific file we should track
-          if [ -n "${{ env.DOWNLOAD_FILE }}" ] && [ -f "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}" ]; then
-            echo "Specifically adding: $DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}"
-            git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}"
-          fi
+          # Commit
+          git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} (split into parts) [skip ci]"
           
-          # Commit the changes
-          git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} from ${{ github.event.inputs.base_login_url }} [skip ci]"
-          
-          # Push to the repository
-          echo "Pushing to origin/$BRANCH..."
-          git push origin "HEAD:$BRANCH"
+          # Push with token authentication
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" "HEAD:$BRANCH"
           
           if [ $? -eq 0 ]; then
             echo "✅ Files pushed successfully!"
-            echo "Download directory: $DOWNLOAD_DIR"
-            echo "File: ${{ env.DOWNLOAD_FILE }}"
+            
+            # Create summary
+            echo "## Download Complete" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Directory:** \`$DOWNLOAD_DIR\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **File:** \`${{ env.DOWNLOAD_FILE }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Location:** https://github.com/${GITHUB_REPOSITORY}/tree/${BRANCH}/${DOWNLOAD_DIR}" >> $GITHUB_STEP_SUMMARY
+            
+            if [ -n "${{ env.SPLIT_PARTS }}" ]; then
+              echo "- **Split into:** ${{ env.SPLIT_PARTS }} parts" >> $GITHUB_STEP_SUMMARY
+              echo "- **Reassemble:** Run \`bash ${DOWNLOAD_DIR}/reassemble_${{ env.DOWNLOAD_FILE }}.sh\`" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "❌ Failed to push to repository"
+            echo "❌ Push failed"
             exit 1
-          fi
-          
-      - name: Summary of download
-        if: success()
-        shell: bash
-        run: |
-          echo "## Download Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Directory:** \`${{ env.DOWNLOAD_DIR }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **File:** \`${{ env.DOWNLOAD_FILE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Base URL:** ${{ github.event.inputs.base_login_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Pushed to repo:** ${{ github.event.inputs.push_to_repo }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -n "${{ env.DOWNLOAD_DIR }}" ] && [ -f "${{ env.DOWNLOAD_DIR }}/MANIFEST.md" ]; then
-            echo "### Manifest Content" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            head -30 "${{ env.DOWNLOAD_DIR }}/MANIFEST.md" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
           fi
