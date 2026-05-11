@@ -12,8 +12,13 @@ on:
         description: 'MPG Password'
         required: true
         type: string
+      base_login_url:
+        description: 'Base login URL (e.g., https://amass.is.tue.mpg.de or https://smpl.is.tue.mpg.de)'
+        required: true
+        type: string
+        default: 'https://amass.is.tue.mpg.de'
       download_url:
-        description: 'Full download URL (e.g., https://amass.is.tue.mpg.de/download.php)'
+        description: 'Full download URL (e.g., https://download.is.tue.mpg.de/download.php?domain=amass&sfile=...)'
         required: true
         type: string
       output_filename:
@@ -53,15 +58,16 @@ jobs:
         env:
           USERNAME: ${{ github.event.inputs.username }}
           PASSWORD: ${{ github.event.inputs.password }}
+          BASE_LOGIN_URL: ${{ github.event.inputs.base_login_url }}
           DOWNLOAD_URL: ${{ github.event.inputs.download_url }}
           OUTPUT_NAME: ${{ github.event.inputs.output_filename }}
           ALLOW_HTML: ${{ github.event.inputs.allow_html }}
         shell: bash
         run: |
-          # Extract base URL from download URL
-          BASE_URL=$(echo "$DOWNLOAD_URL" | grep -oE 'https?://[^/]+')
+          # Remove trailing slash if present
+          BASE_LOGIN_URL=$(echo "$BASE_LOGIN_URL" | sed 's:/*$::')
           
-          echo "Base URL: $BASE_URL"
+          echo "Base Login URL: $BASE_LOGIN_URL"
           echo "Download URL: $DOWNLOAD_URL"
           echo "Allow HTML: $ALLOW_HTML"
           
@@ -72,10 +78,11 @@ jobs:
           cd "$DOWNLOAD_DIR"
           
           # Construct login URL
-          LOGIN_URL="${BASE_URL}/login.php"
+          LOGIN_URL="${BASE_LOGIN_URL}/login.php"
+          
+          echo "Logging in to ${LOGIN_URL}..."
           
           # Login and save session
-          echo "Logging in to ${BASE_URL}..."
           curl -L -c cookies.txt -b cookies.txt \
             -d "username=$USERNAME" \
             -d "password=$PASSWORD" \
@@ -97,21 +104,33 @@ jobs:
           
           # Determine output filename
           if [ -z "$OUTPUT_NAME" ]; then
-            OUTPUT_NAME=$(basename "$DOWNLOAD_URL" | sed 's/?.*//')
-            if [ -z "$OUTPUT_NAME" ] || [ "$OUTPUT_NAME" = "download.php" ]; then
-              OUTPUT_NAME="download_page.html"
+            # Try to extract from sfile parameter if present
+            if [[ "$DOWNLOAD_URL" == *"sfile="* ]]; then
+              OUTPUT_NAME=$(echo "$DOWNLOAD_URL" | grep -oP 'sfile=\K[^&]+' | sed 's/%2F/\//g' | xargs basename)
+            fi
+            
+            # If still empty, try basename of URL
+            if [ -z "$OUTPUT_NAME" ]; then
+              OUTPUT_NAME=$(basename "$DOWNLOAD_URL" | sed 's/?.*//')
+            fi
+            
+            # Final fallback
+            if [ -z "$OUTPUT_NAME" ] || [ "$OUTPUT_NAME" = "download.php" ] || [ "$OUTPUT_NAME" = "download" ]; then
+              OUTPUT_NAME="downloaded_file"
             fi
           fi
           
           echo "Output file: $OUTPUT_NAME"
           
-          # Download with session cookies
-          curl -L -b cookies.txt -c cookies.txt \
+          # Download with session cookies and follow redirects
+          HTTP_CODE=$(curl -L -b cookies.txt -c cookies.txt \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-            -H "Referer: ${BASE_URL}/" \
+            -H "Referer: ${BASE_LOGIN_URL}/" \
             -o "$OUTPUT_NAME" \
-            -w "HTTP Status: %{http_code}\n" \
-            "$DOWNLOAD_URL"
+            -w "%{http_code}" \
+            "$DOWNLOAD_URL")
+          
+          echo "HTTP Status: $HTTP_CODE"
           
           # Check if download was successful
           if [ -f "$OUTPUT_NAME" ] && [ -s "$OUTPUT_NAME" ]; then
@@ -128,7 +147,12 @@ jobs:
             if echo "$file_type" | grep -q "HTML document"; then
               if [ "$ALLOW_HTML" = "false" ]; then
                 echo "⚠ Warning: Downloaded HTML page instead of binary file"
-                echo "  If you want to download HTML pages, set 'allow_html' to true"
+                echo "  This usually means:"
+                echo "    1. Login failed (check credentials)"
+                echo "    2. Wrong base login URL (tried: $BASE_LOGIN_URL)"
+                echo "    3. File requires additional permissions"
+                echo ""
+                echo "  If you intentionally want HTML pages, set 'allow_html' to true"
               else
                 echo "✓ HTML page download allowed"
               fi
@@ -141,45 +165,49 @@ jobs:
               echo "----------------------------------------"
             fi
             
-            # Create manifest
-            echo "# MPG Dataset Download" > MANIFEST.md
-            echo "" >> MANIFEST.md
-            echo "**Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
-            echo "**Base URL:** $BASE_URL" >> MANIFEST.md
-            echo "**Download URL:** $DOWNLOAD_URL" >> MANIFEST.md
-            echo "**Allow HTML:** $ALLOW_HTML" >> MANIFEST.md
-            echo "" >> MANIFEST.md
-            echo "## Downloaded files:" >> MANIFEST.md
-            echo "" >> MANIFEST.md
-            echo "- **$OUTPUT_NAME**" >> MANIFEST.md
-            echo "  - Size: $size" >> MANIFEST.md
-            echo "  - Lines: $lines" >> MANIFEST.md
-            echo "  - Type: $(file "$OUTPUT_NAME" | cut -d: -f2)" >> MANIFEST.md
-            echo "" >> MANIFEST.md
+            # Create manifest using printf instead of heredoc
+            printf "# MPG Dataset Download\n\n" > MANIFEST.md
+            printf "**Date:** %s\n\n" "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> MANIFEST.md
+            printf "**Base Login URL:** %s\n\n" "$BASE_LOGIN_URL" >> MANIFEST.md
+            printf "**Download URL:** %s\n\n" "$DOWNLOAD_URL" >> MANIFEST.md
+            printf "**HTTP Status:** %s\n\n" "$HTTP_CODE" >> MANIFEST.md
+            printf "**Allow HTML:** %s\n\n" "$ALLOW_HTML" >> MANIFEST.md
             
-            # Extract and list download links if it's an HTML page
+            printf "## Downloaded files:\n\n" >> MANIFEST.md
+            printf "- **%s**\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf "  - Size: %s\n" "$size" >> MANIFEST.md
+            printf "  - Lines: %s\n" "$lines" >> MANIFEST.md
+            printf "  - Type: %s\n\n" "$(file "$OUTPUT_NAME" | cut -d: -f2)" >> MANIFEST.md
+            
+            printf "## Usage:\n\n" >> MANIFEST.md
+            printf '```bash\n' >> MANIFEST.md
+            printf "# Check file type\n" >> MANIFEST.md
+            printf "file %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf "# If it's a tar.bz2 file:\n" >> MANIFEST.md
+            printf "tar -xjf %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf "# If it's a tar.gz file:\n" >> MANIFEST.md
+            printf "tar -xzf %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf "# If it's a zip file:\n" >> MANIFEST.md
+            printf "unzip %s\n\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf "# If it's an HTML page (for inspection):\n" >> MANIFEST.md
+            printf "cat %s\n" "$OUTPUT_NAME" >> MANIFEST.md
+            printf '```\n' >> MANIFEST.md
+            
+            # If HTML, extract links for convenience
             if echo "$file_type" | grep -q "HTML document"; then
-              echo "## Available download links found in page:" >> MANIFEST.md
-              echo "" >> MANIFEST.md
-              # Extract links safely
-              grep -E 'href="[^"]*\.(zip|tar|gz|tgz)[^"]*"' "$OUTPUT_NAME" | \
+              printf "\n## Download links found in page:\n\n" >> MANIFEST.md
+              grep -E 'href="[^"]*\.(zip|tar|gz|tgz|bz2|xz|7z)[^"]*"' "$OUTPUT_NAME" | \
                 sed 's/.*href="//; s/".*//' | \
                 while IFS= read -r link; do
-                  echo "- \`$link\`" >> MANIFEST.md
-                done || true
-              echo "" >> MANIFEST.md
+                  printf "- \`%s\`\n" "$link" >> MANIFEST.md
+                done || printf "- No direct download links found\n" >> MANIFEST.md
             fi
-            
-            echo "## Usage:" >> MANIFEST.md
-            echo "View the downloaded page:" >> MANIFEST.md
-            echo '```bash' >> MANIFEST.md
-            echo "cat $OUTPUT_NAME" >> MANIFEST.md
-            echo '```' >> MANIFEST.md
             
             echo "✓ Manifest created successfully"
             
           else
             echo "✗ Download failed - file is empty or missing"
+            echo "HTTP Status: $HTTP_CODE"
             exit 1
           fi
           
@@ -219,7 +247,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Download MPG dataset files [skip ci]"
+            git commit -m "Download MPG dataset files from ${{ github.event.inputs.base_login_url }} [skip ci]"
             git push origin "HEAD:$BRANCH"
             echo "✓ Files pushed successfully!"
           fi
