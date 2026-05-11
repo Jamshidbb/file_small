@@ -52,7 +52,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           
       - name: Configure Git
         run: |
@@ -255,15 +255,12 @@ jobs:
           if [ -z "$DOWNLOAD_DIR" ] || [ ! -d "$DOWNLOAD_DIR" ]; then
             DOWNLOAD_DIR=$(ls -td mpg_download_* 2>/dev/null | head -1)
             if [ -z "$DOWNLOAD_DIR" ]; then
-              echo "❌ No download directory found!"
+              echo "No download directory found!"
               exit 1
             fi
           fi
           
           echo "Download directory: $DOWNLOAD_DIR"
-          echo "Contents:"
-          ls -la "$DOWNLOAD_DIR"
-          echo ""
           
           # Get the current branch
           BRANCH="${GITHUB_REF#refs/heads/}"
@@ -278,31 +275,48 @@ jobs:
             exit 0
           fi
           
-          # Add all files in the download directory
-          git add "$DOWNLOAD_DIR"
+          # Push manifest first
+          if [ -f "$DOWNLOAD_DIR/MANIFEST.md" ]; then
+            echo "Pushing MANIFEST.md..."
+            git add "$DOWNLOAD_DIR/MANIFEST.md"
+            git commit -m "Add MANIFEST.md for MPG dataset [skip ci]"
+            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push "$REMOTE_URL" "HEAD:$BRANCH"
+          fi
           
-          # Commit
-          git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} (split into parts) [skip ci]"
+          # Push reassembly script if it exists
+          if ls "$DOWNLOAD_DIR"/reassemble_*.sh 1> /dev/null 2>&1; then
+            echo "Pushing reassembly script..."
+            git add "$DOWNLOAD_DIR"/reassemble_*.sh
+            git commit -m "Add reassembly script for MPG dataset [skip ci]"
+            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push "$REMOTE_URL" "HEAD:$BRANCH"
+          fi
           
-          # Push with token authentication
-          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$REMOTE_URL" "HEAD:$BRANCH"
+          # Push MD5 file if it exists
+          if [ -f "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}.md5" ]; then
+            echo "Pushing MD5 checksum..."
+            git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}.md5"
+            git commit -m "Add MD5 checksum for MPG dataset [skip ci]"
+            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push "$REMOTE_URL" "HEAD:$BRANCH"
+          fi
           
-          if [ $? -eq 0 ]; then
-            echo "✅ Files pushed successfully!"
-            
-            # Create summary
-            echo "## Download Complete" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- **Directory:** \`$DOWNLOAD_DIR\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **File:** \`${{ env.DOWNLOAD_FILE }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Location:** https://github.com/${GITHUB_REPOSITORY}/tree/${BRANCH}/${DOWNLOAD_DIR}" >> $GITHUB_STEP_SUMMARY
-            
-            if [ -n "${{ env.SPLIT_PARTS }}" ]; then
-              echo "- **Split into:** ${{ env.SPLIT_PARTS }} parts" >> $GITHUB_STEP_SUMMARY
-              echo "- **Reassemble:** Run \`bash ${DOWNLOAD_DIR}/reassemble_${{ env.DOWNLOAD_FILE }}.sh\`" >> $GITHUB_STEP_SUMMARY
+          # Push all split parts at once (simpler and avoids YAML issues)
+          echo "Adding all split parts..."
+          git add "$DOWNLOAD_DIR/${{ env.DOWNLOAD_FILE }}.part"* 2>/dev/null || true
+          
+          # Commit all parts together
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Add MPG dataset: ${{ env.DOWNLOAD_FILE }} [skip ci]"
+            echo "Pushing to repository..."
+            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            if git push "$REMOTE_URL" "HEAD:$BRANCH"; then
+              echo "Files pushed successfully!"
+            else
+              echo "Push failed"
+              exit 1
             fi
           else
-            echo "❌ Push failed"
-            exit 1
+            echo "No new files to push"
           fi
