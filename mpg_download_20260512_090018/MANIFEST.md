@@ -1,0 +1,146 @@
+# MPG Dataset Download
+
+**Date:** 2026-05-12 09:39:52 UTC
+
+**Base Login URL:** https://amass.is.tue.mpg.de
+
+**Download URL:** https://download.is.tue.mpg.de/download.php?domain=amass&resume=1&sfile=amass_per_dataset/smplx/gender_specific/mosh_results/CMU.tar.bz2
+
+**HTTP Status:** 200
+
+**Original Size:** 11G (11572134418 bytes)
+
+## Downloaded files:
+
+**File was split due to GitHub size limit (100MB)**
+
+### Split parts:
+- `CMU.tar.bz2.part00` (95M)
+- `CMU.tar.bz2.part01` (95M)
+- `CMU.tar.bz2.part02` (95M)
+- `CMU.tar.bz2.part03` (95M)
+- `CMU.tar.bz2.part04` (95M)
+- `CMU.tar.bz2.part05` (95M)
+- `CMU.tar.bz2.part06` (95M)
+- `CMU.tar.bz2.part07` (95M)
+- `CMU.tar.bz2.part08` (95M)
+- `CMU.tar.bz2.part09` (95M)
+- `CMU.tar.bz2.part10` (95M)
+- `CMU.tar.bz2.part11` (95M)
+- `CMU.tar.bz2.part12` (95M)
+- `CMU.tar.bz2.part13` (95M)
+- `CMU.tar.bz2.part14` (95M)
+- `CMU.tar.bz2.part15` (95M)
+- `CMU.tar.bz2.part16` (95M)
+- `CMU.tar.bz2.part17` (95M)
+- `CMU.tar.bz2.part18` (95M)
+- `CMU.tar.bz2.part19` (95M)
+- `CMU.tar.bz2.part20` (95M)
+- `CMU.tar.bz2.part21` (95M)
+- `CMU.tar.bz2.part22` (95M)
+- `CMU.tar.bz2.part23` (95M)
+- `CMU.tar.bz2.part24` (95M)
+- `CMU.tar.bz2.part25` (95M)
+- `CMU.tar.bz2.part26` (95M)
+- `CMU.tar.bz2.part27` (95M)
+- `CMU.tar.bz2.part28` (95M)
+- `CMU.tar.bz2.part29` (95M)
+- `CMU.tar.bz2.part30` (95M)
+- `CMU.tar.bz2.part31` (95M)
+- `CMU.tar.bz2.part32` (95M)
+- `CMU.tar.bz2.part33` (95M)
+- `CMU.tar.bz2.part34` (95M)
+- `CMU.tar.bz2.part35` (95M)
+- `CMU.tar.bz2.part36` (95M)
+- `CMU.tar.bz2.part37` (95M)
+- `CMU.tar.bz2.part38` (95M)
+- `CMU.tar.bz2.part39` (95M)
+- `CMU.tar.bz2.part40` (95M)
+- `CMU.tar.bz2.part41` (95M)
+- `CMU.tar.bz2.part42` (95M)
+- `CMU.tar.bz2.part43` (95M)
+- `CMU.tar.bz2.part44` (95M)
+- `CMU.tar.bz2.part45` (95M)
+- `CMU.tar.bz2.part46` (95M)
+- `CMU.tar.bz2.part47` (95M)
+- `CMU.tar.bz2.part48` (95M)
+- `CMU.tar.bz2.part49` (95M)
+- `CMU.tar.bz2.part50` (95M)
+- `CMU.tar.bz2.part51` (95M)
+- `CMU.tar.bz2.part52` (95M)
+- `CMU.tar.bz2.part53` (95M)
+- `CMU.tar.bz2.part54` (95M)
+- `CMU.tar.bz2.part55` (95M)
+- `CMU.tar.bz2.part56` (95M)
+- `CMU.tar.bz2.part57` (95M)
+- `CMU.tar.bz2.part58` (95M)
+- `CMU.tar.bz2.part59` (95M)
+- `CMU.tar.bz2.part60` (95M)
+- `CMU.tar.bz2.part61` (95M)
+- `CMU.tar.bz2.part62` (95M)
+- `CMU.tar.bz2.part63` (95M)
+- `CMU.tar.bz2.part64` (96M)
+- `CMU.tar.bz2.part65` (96M)
+- `CMU.tar.bz2.part66` (95M)
+- `CMU.tar.bz2.part67` (95M)
+- `CMU.tar.bz2.part68` (95M)
+- `CMU.tar.bz2.part69` (95M)
+- `CMU.tar.bz2.part70` (95M)
+- `CMU.tar.bz2.part71` (95M)
+- `CMU.tar.bz2.part72` (95M)
+- `CMU.tar.bz2.part73` (95M)
+- `CMU.tar.bz2.part74` (95M)
+- `CMU.tar.bz2.part75` (95M)
+- `CMU.tar.bz2.part76` (95M)
+- `CMU.tar.bz2.part77` (95M)
+- `CMU.tar.bz2.part78` (95M)
+- `CMU.tar.bz2.part79` (95M)
+- `CMU.tar.bz2.part80` (95M)
+- `CMU.tar.bz2.part81` (95M)
+- `CMU.tar.bz2.part82` (95M)
+- `CMU.tar.bz2.part83` (95M)
+- `CMU.tar.bz2.part84` (95M)
+- `CMU.tar.bz2.part85` (95M)
+- `CMU.tar.bz2.part86` (95M)
+- `CMU.tar.bz2.part87` (95M)
+- `CMU.tar.bz2.part88` (95M)
+- `CMU.tar.bz2.part89` (95M)
+- `CMU.tar.bz2.part9000` (95M)
+- `CMU.tar.bz2.part9001` (95M)
+- `CMU.tar.bz2.part9002` (95M)
+- `CMU.tar.bz2.part9003` (95M)
+- `CMU.tar.bz2.part9004` (95M)
+- `CMU.tar.bz2.part9005` (95M)
+- `CMU.tar.bz2.part9006` (95M)
+- `CMU.tar.bz2.part9007` (95M)
+- `CMU.tar.bz2.part9008` (95M)
+- `CMU.tar.bz2.part9009` (95M)
+- `CMU.tar.bz2.part9010` (95M)
+- `CMU.tar.bz2.part9011` (95M)
+- `CMU.tar.bz2.part9012` (95M)
+- `CMU.tar.bz2.part9013` (95M)
+- `CMU.tar.bz2.part9014` (95M)
+- `CMU.tar.bz2.part9015` (95M)
+- `CMU.tar.bz2.part9016` (95M)
+- `CMU.tar.bz2.part9017` (95M)
+- `CMU.tar.bz2.part9018` (95M)
+- `CMU.tar.bz2.part9019` (95M)
+- `CMU.tar.bz2.part9020` (95M)
+- `CMU.tar.bz2.part9021` (95M)
+- `CMU.tar.bz2.part9022` (95M)
+- `CMU.tar.bz2.part9023` (95M)
+- `CMU.tar.bz2.part9024` (95M)
+- `CMU.tar.bz2.part9025` (95M)
+- `CMU.tar.bz2.part9026` (17M)
+
+**Split into 117 parts (95m each)**\n\nTo reassemble:\n```bash\nbash reassemble_CMU.tar.bz2.sh\nmd5sum -c CMU.tar.bz2.md5\n```\n
+## Usage:
+
+```bash
+# Extract the dataset
+# First reassemble the file:
+bash reassemble_CMU.tar.bz2.sh
+
+# Then extract:
+tar -xjf CMU.tar.bz2
+```
