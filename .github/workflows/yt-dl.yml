@@ -1,0 +1,606 @@
+name: YouTube Video Downloader with Quality Selection
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL'
+        required: true
+        default: ''
+        type: string
+      quality:
+        description: 'Video Quality'
+        required: true
+        default: '1080p'
+        type: choice
+        options:
+          - 'Best Available'
+          - '2160p (4K)'
+          - '1440p (2K)'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+          - '240p'
+          - '144p'
+          - 'Audio Only (Best)'
+          - 'Audio Only (MP3)'
+      output_folder:
+        description: 'Folder name to store downloaded files'
+        required: false
+        default: 'downloads'
+        type: string
+
+jobs:
+  parse-and-download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      # Cache apt packages
+      - name: Cache apt packages
+        uses: actions/cache@v3
+        id: apt-cache
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+      
+      # Install ffmpeg and dependencies
+      - name: Install ffmpeg and dependencies
+        run: |
+          echo "========================================="
+          echo "INSTALLING FFMPEG AND DEPENDENCIES"
+          echo "========================================="
+          
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y \
+            libavcodec-extra \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev
+          
+          echo ""
+          echo "✅ FFmpeg version:"
+          ffmpeg -version | head -3
+      
+      # Install jq
+      - name: Install jq
+        run: |
+          if command -v jq &> /dev/null; then
+            echo "✅ jq already installed: $(jq --version)"
+          else
+            sudo apt-get install -y jq
+          fi
+      
+      # Generate URL hash for cache
+      - name: Generate URL hash
+        id: url-hash
+        run: |
+          echo -n "${{ inputs.url }}" | sha256sum | cut -d' ' -f1 > url-hash.txt
+          echo "URL_HASH=$(cat url-hash.txt)" >> $GITHUB_ENV
+      
+      # Cache API response
+      - name: Cache API response
+        uses: actions/cache@v3
+        id: api-cache
+        with:
+          path: response.json
+          key: ${{ runner.os }}-yt-${{ env.URL_HASH }}
+          restore-keys: |
+            ${{ runner.os }}-yt-
+      
+      # Fetch video data
+      - name: Fetch video data
+        run: |
+          if [ "${{ steps.api-cache.outputs.cache-hit }}" == "true" ] && [ -f response.json ] && [ -s response.json ]; then
+            echo "✅ Using cached API response"
+            if ! jq empty response.json 2>/dev/null; then
+              echo "⚠️ Cached file invalid, refetching..."
+              rm -f response.json
+              CACHE_HIT=false
+            else
+              CACHE_HIT=true
+            fi
+          else
+            CACHE_HIT=false
+          fi
+          
+          if [ "$CACHE_HIT" != "true" ]; then
+            echo "Fetching fresh data from API..."
+            curl -X POST "https://app.ytdown.to/proxy.php" \
+              -H "accept: */*" \
+              -H "content-type: application/x-www-form-urlencoded; charset=UTF-8" \
+              --data-urlencode "url=${{ inputs.url }}" \
+              --max-time 60 \
+              -o response.json \
+              -s \
+              --write-out "\n✅ Data fetched (HTTP %{http_code}, Time: %{time_total}s)\n"
+            
+            if ! jq empty response.json 2>/dev/null; then
+              echo "❌ Invalid JSON response"
+              cat response.json
+              exit 1
+            fi
+            
+            echo "✅ Data fetched and validated"
+          fi
+      
+      # Extract video info and find best matching format
+      - name: Find matching format by quality
+        id: find_format
+        run: |
+          echo "========================================="
+          echo "SELECTING QUALITY: ${{ inputs.quality }}"
+          echo "========================================="
+          
+          # Extract video info
+          TITLE=$(jq -r '.api.title // "Unknown Title"' response.json)
+          CHANNEL=$(jq -r '.api.userInfo.name // "Unknown Channel"' response.json)
+          VIDEO_ID=$(jq -r '.api.id // "unknown"' response.json)
+          
+          echo "Video: $TITLE"
+          echo "Channel: $CHANNEL"
+          echo ""
+          
+          # Save to env
+          echo "VIDEO_TITLE=$TITLE" >> $GITHUB_ENV
+          echo "VIDEO_CHANNEL=$CHANNEL" >> $GITHUB_ENV
+          echo "VIDEO_ID=$VIDEO_ID" >> $GITHUB_ENV
+          
+          # Display available formats
+          echo "Available formats:"
+          echo "----------------------------------------"
+          jq -r '.api.mediaItems[] | "  \(.type) | \(.mediaQuality) | \(.mediaRes // "Audio Only") | \(.mediaFileSize)"' response.json
+          echo "----------------------------------------"
+          echo ""
+          
+          QUALITY="${{ inputs.quality }}"
+          
+          # Function to find best match
+          find_best_match() {
+            local target_quality="$1"
+            local response_file="$2"
+            
+            # Parse quality selection
+            case "$target_quality" in
+              "Best Available")
+                # Get video with highest resolution, or best audio if no video
+                jq -r '.api.mediaItems | 
+                  map(select(.type == "video")) | 
+                  sort_by(.mediaRes | sub("p"; "") | tonumber? // 0) | 
+                  reverse | 
+                  .[0] // .api.mediaItems | map(select(.type == "audio")) | .[0] // empty' "$response_file"
+                ;;
+              "2160p (4K)")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "2160p")' "$response_file"
+                ;;
+              "1440p (2K)")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "1440p")' "$response_file"
+                ;;
+              "1080p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "1080p")' "$response_file"
+                ;;
+              "720p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "720p")' "$response_file"
+                ;;
+              "480p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "480p")' "$response_file"
+                ;;
+              "360p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "360p")' "$response_file"
+                ;;
+              "240p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "240p")' "$response_file"
+                ;;
+              "144p")
+                jq -r '.api.mediaItems[] | select(.type == "video" and .mediaRes == "144p")' "$response_file"
+                ;;
+              "Audio Only (Best)")
+                jq -r '.api.mediaItems | 
+                  map(select(.type == "audio")) | 
+                  sort_by(.mediaBitrate // 0) | 
+                  reverse | 
+                  .[0]' "$response_file"
+                ;;
+              "Audio Only (MP3)")
+                jq -r '.api.mediaItems[] | select(.type == "audio" and .mediaExtension == "mp3")' "$response_file"
+                ;;
+              *)
+                # Default to best available
+                jq -r '.api.mediaItems | 
+                  map(select(.type == "video")) | 
+                  sort_by(.mediaRes | sub("p"; "") | tonumber? // 0) | 
+                  reverse | 
+                  .[0] // .api.mediaItems | map(select(.type == "audio")) | .[0] // empty' "$response_file"
+                ;;
+            esac
+          }
+          
+          # Find the format
+          SELECTED_FORMAT=$(find_best_match "$QUALITY" "response.json")
+          
+          if [ -z "$SELECTED_FORMAT" ] || [ "$SELECTED_FORMAT" = "null" ]; then
+            echo "❌ No format found matching: $QUALITY"
+            echo ""
+            echo "Trying fallback to best available..."
+            SELECTED_FORMAT=$(jq -r '.api.mediaItems | 
+              map(select(.type == "video")) | 
+              sort_by(.mediaRes | sub("p"; "") | tonumber? // 0) | 
+              reverse | 
+              .[0] // .api.mediaItems | map(select(.type == "audio")) | .[0] // empty' "response.json")
+          fi
+          
+          if [ -z "$SELECTED_FORMAT" ] || [ "$SELECTED_FORMAT" = "null" ]; then
+            echo "❌ No valid formats found at all!"
+            exit 1
+          fi
+          
+          # Extract format details
+          echo "$SELECTED_FORMAT" > selected_format.json
+          
+          FORMAT_TYPE=$(jq -r '.type' selected_format.json)
+          FORMAT_QUALITY=$(jq -r '.mediaQuality' selected_format.json)
+          FORMAT_RES=$(jq -r '.mediaRes // "N/A"' selected_format.json)
+          FORMAT_SIZE=$(jq -r '.mediaFileSize' selected_format.json)
+          FORMAT_EXT=$(jq -r '.mediaExtension' selected_format.json)
+          FORMAT_URL=$(jq -r '.mediaUrl' selected_format.json)
+          
+          echo ""
+          echo "========================================="
+          echo "✅ SELECTED FORMAT:"
+          echo "========================================="
+          echo "Type: $FORMAT_TYPE"
+          echo "Quality: $FORMAT_QUALITY"
+          echo "Resolution: $FORMAT_RES"
+          echo "Size: $FORMAT_SIZE"
+          echo "Extension: $FORMAT_EXT"
+          echo ""
+          
+          # Save to env
+          echo "SELECTED_FORMAT_TYPE=$FORMAT_TYPE" >> $GITHUB_ENV
+          echo "SELECTED_FORMAT_QUALITY=$FORMAT_QUALITY" >> $GITHUB_ENV
+          echo "SELECTED_FORMAT_RES=$FORMAT_RES" >> $GITHUB_ENV
+          echo "SELECTED_FORMAT_SIZE=$FORMAT_SIZE" >> $GITHUB_ENV
+          echo "SELECTED_FORMAT_EXT=$FORMAT_EXT" >> $GITHUB_ENV
+          echo "SELECTED_FORMAT_URL=$FORMAT_URL" >> $GITHUB_ENV
+          
+          # Check if this is audio only
+          if [ "$FORMAT_TYPE" = "audio" ]; then
+            echo "AUDIO_ONLY=true" >> $GITHUB_ENV
+          else
+            echo "AUDIO_ONLY=false" >> $GITHUB_ENV
+          fi
+      
+      # Create output directory
+      - name: Create output directory
+        run: |
+          mkdir -p "${{ inputs.output_folder }}"
+          echo "Created directory: ${{ inputs.output_folder }}"
+      
+      # Download the selected format
+      - name: Download video/audio file
+        run: |
+          echo "========================================="
+          echo "DOWNLOADING FILE"
+          echo "========================================="
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          SAFE_TITLE=$(echo "$VIDEO_TITLE" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-100)
+          
+          if [ "$AUDIO_ONLY" = "true" ]; then
+            OUTPUT_FILE="${{ inputs.output_folder }}/${SAFE_TITLE}_audio_${TIMESTAMP}.${SELECTED_FORMAT_EXT}"
+          else
+            OUTPUT_FILE="${{ inputs.output_folder }}/${SAFE_TITLE}_${SELECTED_FORMAT_RES}_${TIMESTAMP}.${SELECTED_FORMAT_EXT}"
+          fi
+          
+          echo "Downloading from: $SELECTED_FORMAT_URL"
+          echo "Output: $OUTPUT_FILE"
+          echo ""
+          
+          curl -L "$SELECTED_FORMAT_URL" \
+            -o "$OUTPUT_FILE" \
+            --progress-bar \
+            --write-out "\nHTTP Status: %{http_code}\nTime: %{time_total}s\nSize: %{size_download} bytes\n" \
+            --max-time 600 \
+            --retry 3 \
+            --retry-delay 2
+          
+          if [ -f "$OUTPUT_FILE" ]; then
+            ACTUAL_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "0")
+            SIZE_HUMAN=$(du -h "$OUTPUT_FILE" | cut -f1)
+            
+            echo ""
+            echo "✅ Download complete: $SIZE_HUMAN ($ACTUAL_SIZE bytes)"
+            echo "OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
+            echo "OUTPUT_SIZE=$ACTUAL_SIZE" >> $GITHUB_ENV
+            echo "OUTPUT_SIZE_HUMAN=$SIZE_HUMAN" >> $GITHUB_ENV
+          else
+            echo "❌ Download failed!"
+            exit 1
+          fi
+      
+      # Create checksums
+      - name: Create checksums
+        run: |
+          echo "Creating checksums..."
+          
+          MD5_HASH=$(md5sum "$OUTPUT_FILE" | cut -d' ' -f1)
+          SHA256_HASH=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
+          
+          echo "$MD5_HASH" > "${OUTPUT_FILE}.md5"
+          echo "$SHA256_HASH" > "${OUTPUT_FILE}.sha256"
+          
+          echo "OUTPUT_FILE_MD5=$MD5_HASH" >> $GITHUB_ENV
+          echo "OUTPUT_FILE_SHA256=$SHA256_HASH" >> $GITHUB_ENV
+          
+          echo "✅ MD5: $MD5_HASH"
+          echo "✅ SHA256: $SHA256_HASH"
+      
+      # Create metadata
+      - name: Create metadata
+        run: |
+          cat > "${OUTPUT_FILE}.meta.json" << 'EOF'
+          {
+            "source_url": "${{ inputs.url }}",
+            "title": "$VIDEO_TITLE",
+            "channel": "$VIDEO_CHANNEL",
+            "video_id": "$VIDEO_ID",
+            "requested_quality": "${{ inputs.quality }}",
+            "downloaded_format": {
+              "type": "$SELECTED_FORMAT_TYPE",
+              "quality": "$SELECTED_FORMAT_QUALITY",
+              "resolution": "$SELECTED_FORMAT_RES",
+              "size": "$SELECTED_FORMAT_SIZE",
+              "extension": "$SELECTED_FORMAT_EXT"
+            },
+            "download_date": "$(date -u +"%Y-%m-%d %H:%M:%S UTC")",
+            "file_size": "$OUTPUT_SIZE_HUMAN",
+            "file_size_bytes": $OUTPUT_SIZE,
+            "md5": "$OUTPUT_FILE_MD5",
+            "sha256": "$OUTPUT_FILE_SHA256"
+          }
+          EOF
+          
+          echo "✅ Metadata created"
+      
+      # Create markdown report
+      - name: Create markdown report
+        run: |
+          cat > "VIDEO_INFO.md" << 'EOF'
+          # 📹 YouTube Video Download
+          
+          ## Video Information
+          
+          | Field | Value |
+          |-------|-------|
+          | **Title** | $VIDEO_TITLE |
+          | **Channel** | $VIDEO_CHANNEL |
+          | **Video ID** | $VIDEO_ID |
+          | **Source URL** | ${{ inputs.url }} |
+          | **Download Date** | $(date -u +"%Y-%m-%d %H:%M:%S UTC") |
+          
+          ## Download Details
+          
+          | Field | Value |
+          |-------|-------|
+          | **Requested Quality** | ${{ inputs.quality }} |
+          | **Downloaded Type** | $SELECTED_FORMAT_TYPE |
+          | **Downloaded Quality** | $SELECTED_FORMAT_QUALITY |
+          | **Resolution** | $SELECTED_FORMAT_RES |
+          | **File Size** | $OUTPUT_SIZE_HUMAN |
+          | **Extension** | $SELECTED_FORMAT_EXT |
+          
+          ## Checksums
+          
+          - **MD5:** `$OUTPUT_FILE_MD5`
+          - **SHA256:** `$OUTPUT_FILE_SHA256`
+          
+          ## File Location
+          
+          The downloaded file is available at: `$OUTPUT_FILE`
+          EOF
+          
+          echo "✅ Markdown report created"
+      
+      # Split large file (over 100MB)
+      - name: Split large file into parts
+        id: split
+        if: env.OUTPUT_SIZE > 104857600
+        run: |
+          echo "========================================="
+          echo "FILE EXCEEDS 100MB - SPLITTING"
+          echo "========================================="
+          echo "File size: $OUTPUT_SIZE_HUMAN"
+          echo "Splitting into 95MB parts..."
+          
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          PARTS_DIR="${{ inputs.output_folder }}/parts_${TIMESTAMP}"
+          mkdir -p "$PARTS_DIR"
+          
+          BASENAME=$(basename "$OUTPUT_FILE")
+          BASENAME_NOEXT="${BASENAME%.*}"
+          
+          # Copy file to parts directory
+          cp "$OUTPUT_FILE" "${PARTS_DIR}/"
+          
+          # Split with 3-digit zero-padded numbering
+          cd "$PARTS_DIR"
+          split -b 95M -d -a 3 "$BASENAME" "${BASENAME_NOEXT}.part."
+          
+          # Rename part000 to part001, etc.
+          for f in ${BASENAME_NOEXT}.part.*; do
+            if [ -f "$f" ]; then
+              OLD_NUM=$(echo "$f" | grep -o '[0-9]*$')
+              NEW_NUM=$((10#$OLD_NUM + 1))
+              NEW_NUM_PADDED=$(printf "%03d" $NEW_NUM)
+              NEW_NAME="${BASENAME_NOEXT}.part${NEW_NUM_PADDED}"
+              mv "$f" "$NEW_NAME"
+            fi
+          done
+          
+          # Remove original
+          rm -f "$BASENAME"
+          
+          # Count parts
+          PART_COUNT=$(ls -1 ${BASENAME_NOEXT}.part* 2>/dev/null | wc -l)
+          echo "Created $PART_COUNT parts"
+          
+          # Create checksums
+          md5sum ${BASENAME_NOEXT}.part* > checksums.md5
+          sha256sum ${BASENAME_NOEXT}.part* > checksums.sha256
+          
+          # Create reassembly scripts
+          cat > reassemble.sh << 'EOF'
+          #!/bin/bash
+          echo "Reassembling file..."
+          BASENAME=$(ls -1 *.part[0-9][0-9][0-9] 2>/dev/null | head -1 | sed 's/\.part[0-9]*$//')
+          if [ -n "$BASENAME" ]; then
+            cat ${BASENAME}.part* > "$BASENAME"
+            echo "✅ Reassembled: $BASENAME"
+            echo "Size: $(du -h "$BASENAME" | cut -f1)"
+          else
+            echo "❌ No part files found"
+            exit 1
+          fi
+          EOF
+          
+          cat > reassemble.bat << 'EOF'
+          @echo off
+          echo Reassembling file...
+          for %%f in (*.part???) do set "BASENAME=%%~nf" & set "BASENAME=!BASENAME:.part=!" & goto :found
+          :found
+          if "%BASENAME%"=="" (echo Error: No part files found & exit /b 1)
+          copy /b %BASENAME%.part* %BASENAME%
+          echo Reassembled: %BASENAME%
+          EOF
+          
+          chmod +x reassemble.sh
+          
+          # Copy metadata
+          cp "../$(basename "$OUTPUT_FILE").md5" . 2>/dev/null || true
+          cp "../$(basename "$OUTPUT_FILE").sha256" . 2>/dev/null || true
+          cp "../$(basename "$OUTPUT_FILE").meta.json" . 2>/dev/null || true
+          cp "../VIDEO_INFO.md" . 2>/dev/null || true
+          
+          cd -
+          
+          echo "TOTAL_PARTS=$PART_COUNT" >> $GITHUB_ENV
+          echo "PARTS_DIR=$PARTS_DIR" >> $GITHUB_ENV
+          echo "BASENAME_NOEXT=$BASENAME_NOEXT" >> $GITHUB_ENV
+      
+      # Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+      
+      # Push files to repository
+      - name: Push files to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Pull latest changes
+          git pull origin ${{ github.ref_name }} --no-rebase --autostash || echo "No changes to pull"
+          
+          # Add files
+          if [ -n "$PARTS_DIR" ]; then
+            # Add parts directory
+            git add "$PARTS_DIR/"
+          else
+            # Add the downloaded file and its metadata
+            git add "$OUTPUT_FILE"
+            git add "${OUTPUT_FILE}.md5"
+            git add "${OUTPUT_FILE}.sha256"
+            git add "${OUTPUT_FILE}.meta.json"
+          fi
+          
+          # Add report files
+          git add VIDEO_INFO.md
+          git add response.json
+          
+          # Commit and push
+          if git diff --staged --quiet; then
+            echo "No new changes to commit"
+          else
+            git commit -m "Download: $VIDEO_TITLE ($SELECTED_FORMAT_RES) [skip ci]"
+            
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            PUSH_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$PUSH_SUCCESS" = false ]; do
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "Push attempt $RETRY_COUNT..."
+              
+              if git push origin HEAD:${{ github.ref_name }}; then
+                PUSH_SUCCESS=true
+                echo "✅ Push successful!"
+              else
+                echo "⚠️ Push failed, pulling latest..."
+                git pull origin ${{ github.ref_name }} --rebase --autostash
+              fi
+            done
+            
+            if [ "$PUSH_SUCCESS" = false ]; then
+              echo "❌ Failed to push after $MAX_RETRIES attempts"
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Files pushed to repository"
+      
+      # Create workflow summary
+      - name: Create workflow summary
+        if: always()
+        run: |
+          echo "## ✅ Download Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📹 Video Information" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Title** | $VIDEO_TITLE |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Channel** | $VIDEO_CHANNEL |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requested Quality** | ${{ inputs.quality }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Downloaded** | $SELECTED_FORMAT_TYPE - $SELECTED_FORMAT_QUALITY ($SELECTED_FORMAT_RES) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **File Size** | $OUTPUT_SIZE_HUMAN |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$PARTS_DIR" ]; then
+            echo "### 📦 Split into $TOTAL_PARTS parts" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Location:** \`$PARTS_DIR/\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**To reassemble:**" >> $GITHUB_STEP_SUMMARY
+            echo "- Linux/Mac: Run \`./reassemble.sh\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Windows: Run \`reassemble.bat\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📁 File Location" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The file has been saved to: \`$OUTPUT_FILE\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 View in Repository" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[Browse files](${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${{ inputs.output_folder }})" >> $GITHUB_STEP_SUMMARY
+      
+      # Upload artifact for quick access
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-download
+          path: |
+            ${{ env.OUTPUT_FILE }}
+            VIDEO_INFO.md
+          retention-days: 7
+          if-no-files-found: ignore
